@@ -3,7 +3,10 @@ use serde_json::Value;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::{error::GatewayResult, state::AppState};
+use crate::{
+    error::{GatewayError, GatewayResult},
+    state::AppState,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UtilityPaymentEvent {
@@ -148,7 +151,7 @@ fn decode_reference_hex(reference_hex: &str) -> GatewayResult<Vec<u8>> {
     let normalized = normalize_reference_hex(reference_hex);
 
     if normalized.len() != 64 {
-        return Err(crate::error::GatewayError::Validation(
+        return Err(GatewayError::Upstream(
             "payment reference must be 32 bytes / 64 hex characters".to_string(),
         ));
     }
@@ -156,10 +159,10 @@ fn decode_reference_hex(reference_hex: &str) -> GatewayResult<Vec<u8>> {
     let mut bytes = Vec::with_capacity(32);
     for chunk in normalized.as_bytes().chunks(2) {
         let hex_pair = std::str::from_utf8(chunk).map_err(|_| {
-            crate::error::GatewayError::Validation("payment reference is not valid hex".to_string())
+            GatewayError::Upstream("payment reference is not valid hex".to_string())
         })?;
         let byte = u8::from_str_radix(hex_pair, 16).map_err(|_| {
-            crate::error::GatewayError::Validation("payment reference is not valid hex".to_string())
+            GatewayError::Upstream("payment reference is not valid hex".to_string())
         })?;
         bytes.push(byte);
     }
