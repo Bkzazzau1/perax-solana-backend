@@ -1,0 +1,72 @@
+name: Pera-X Backend Check
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  check-backend:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: perax
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/perax
+      REDIS_URL: redis://127.0.0.1:6379
+      SOLANA_RPC_URL: https://api.devnet.solana.com
+      SOLANA_WS_URL: wss://api.devnet.solana.com
+      PERAX_ANCHOR_WORKSPACE: /tmp/perax-contracts
+      PERAX_PROGRAM_ID: "11111111111111111111111111111111"
+      TRADING_CO_TREASURY: "replace-with-trading-company-token-account"
+      BURN_EXECUTION_MODE: manual
+      JWT_SECRET: "replace-with-at-least-32-characters-secret"
+      CLAUDE_BASE_URL: https://api.anthropic.com
+      COPYLEAKS_BASE_URL: https://api.copyleaks.com
+      TELNYX_BASE_URL: https://api.telnyx.com
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run migrations
+        run: cargo install sqlx-cli --no-default-features --features rustls,postgres && sqlx migrate run
+
+      - name: Run tests
+        run: cargo test --all
+
+      - name: Check build
+        run: cargo check --all-targets
