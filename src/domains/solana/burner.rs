@@ -2,9 +2,10 @@
 use serde_json::json;
 use std::time::Duration;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::{
-    domains::solana::policy::{calculate_daily_burn_decision, MarketPolicyInput},
+    domains::solana::policy::{calculate_daily_burn_decision, DailyBurnDecision, MarketPolicyInput},
     error::GatewayError,
     state::AppState,
 };
@@ -47,8 +48,20 @@ async fn execute_daily_revenue_burn(state: &AppState) -> Result<(), GatewayError
 
     let market_input = build_market_policy_input(trading_company_balance);
     let decision = calculate_daily_burn_decision(market_input);
+    let tokens_to_burn = trading_company_balance * decision.burn_rate;
+
+    let decision_id = persist_burn_decision(
+        state,
+        &decision,
+        trading_company_balance,
+        tokens_to_burn,
+        "declared",
+        None,
+    )
+    .await?;
 
     info!(
+        decision_id = %decision_id,
         burn_rate_percent = %format!("{:.2}%", decision.burn_rate_percent),
         reason = %decision.reason,
         market_health_score = %decision.market_health_score,
@@ -56,10 +69,9 @@ async fn execute_daily_revenue_burn(state: &AppState) -> Result<(), GatewayError
         utility_usage_score = %decision.utility_usage_score,
         holder_pressure_score = %decision.holder_pressure_score,
         trading_company_wallet_score = %decision.trading_company_wallet_score,
-        "Daily Pera-X burn policy decision declared"
+        "Daily Pera-X burn policy decision declared and saved"
     );
 
-    let tokens_to_burn = trading_company_balance * decision.burn_rate;
     info!(
         accumulated_balance = %trading_company_balance,
         tokens_to_burn = %tokens_to_burn,
@@ -70,12 +82,80 @@ async fn execute_daily_revenue_burn(state: &AppState) -> Result<(), GatewayError
     // from the Trading Company token account and submit it via Solana RPC.
     let tx_signature = "MOCK_SOLANA_BURN_SIGNATURE_HASH";
 
+    mark_burn_decision_executed(state, decision_id, tx_signature).await?;
+
     info!(
+        decision_id = %decision_id,
         signature = %tx_signature,
         burned_amount = %tokens_to_burn,
         burn_rate_percent = %format!("{:.2}%", decision.burn_rate_percent),
-        "Daily burn successfully finalized on-chain"
+        "Daily burn successfully finalized on-chain and persisted"
     );
+
+    Ok(())
+}
+
+async fn persist_burn_decision(
+    state: &AppState,
+    decision: &DailyBurnDecision,
+    trading_company_balance: f64,
+    tokens_to_burn: f64,
+    status: &str,
+    tx_signature: Option<&str>,
+) -> Result<Uuid, GatewayError> {
+    let decision_id = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        insert into daily_burn_decisions (
+            burn_rate,
+            burn_rate_percent,
+            market_health_score,
+            liquidity_score,
+            utility_usage_score,
+            holder_pressure_score,
+            trading_company_wallet_score,
+            trading_company_balance,
+            tokens_to_burn,
+            reason,
+            tx_signature,
+            status
+        ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        returning id
+        "#,
+    )
+    .bind(decision.burn_rate)
+    .bind(decision.burn_rate_percent)
+    .bind(decision.market_health_score)
+    .bind(decision.liquidity_score)
+    .bind(decision.utility_usage_score)
+    .bind(decision.holder_pressure_score)
+    .bind(decision.trading_company_wallet_score)
+    .bind(trading_company_balance)
+    .bind(tokens_to_burn)
+    .bind(&decision.reason)
+    .bind(tx_signature)
+    .bind(status)
+    .fetch_one(&state.db)
+    .await?;
+
+    Ok(decision_id)
+}
+
+async fn mark_burn_decision_executed(
+    state: &AppState,
+    decision_id: Uuid,
+    tx_signature: &str,
+) -> Result<(), GatewayError> {
+    sqlx::query(
+        r#"
+        update daily_burn_decisions
+        set status = 'executed', tx_signature = $1, updated_at = now()
+        where id = $2
+        "#,
+    )
+    .bind(tx_signature)
+    .bind(decision_id)
+    .execute(&state.db)
+    .await?;
 
     Ok(())
 }
