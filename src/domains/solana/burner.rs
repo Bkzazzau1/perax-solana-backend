@@ -3,7 +3,11 @@ use serde_json::json;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
-use crate::{error::GatewayError, state::AppState};
+use crate::{
+    domains::solana::policy::{calculate_daily_burn_decision, MarketPolicyInput},
+    error::GatewayError,
+    state::AppState,
+};
 
 pub fn spawn_daily_burner(state: AppState) {
     tokio::spawn(async move {
@@ -13,7 +17,7 @@ pub fn spawn_daily_burner(state: AppState) {
         );
 
         loop {
-            // Run on a 24-hour cycle as specified in the background architecture
+            // Run on a 24-hour cycle as specified in the Pera-X economic policy.
             tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
 
             info!("Initiating daily tokenomic validation cycle...");
@@ -23,7 +27,7 @@ pub fn spawn_daily_burner(state: AppState) {
                 error!(error = %err, "Failed to complete daily token burn sequence");
             }
 
-            // 2. ALGORITHMIC MARKET MODERATION (200% Growth Release check)
+            // 2. ALGORITHMIC MARKET MODERATION
             if let Err(err) = evaluate_market_stabilization(&state).await {
                 error!(error = %err, "Failed to execute market stabilization check");
             }
@@ -31,24 +35,52 @@ pub fn spawn_daily_burner(state: AppState) {
     });
 }
 
-/// Automatically calculates market health conditions and burns the approved percentage of tokens
-/// collected inside the Trading Company revenue wallet.
+/// Calculates the approved daily burn decision and burns the required percentage
+/// of tokens collected inside the Trading Company revenue wallet.
 async fn execute_daily_revenue_burn(state: &AppState) -> Result<(), GatewayError> {
-    // Determine current market condition and resolve corresponding burn bracket
-    // Real deployment would analyze trading data; defaulting safely to standard operational baseline
-    let current_market_weakness_factor = 0.0; // 0.0 = Healthy, 1.0 = Emergency
+    let trading_company_balance = fetch_trading_company_token_balance(state).await?;
 
-    let burn_rate = if current_market_weakness_factor > 0.8 {
-        0.25 // Emergency weakness: 25% to 30% burn bracket
-    } else if current_market_weakness_factor > 0.4 {
-        0.12 // Mild/Strong weakness: 10% to 20% burn bracket
-    } else {
-        0.04 // Healthy market: 2% to 5% burn bracket
-    };
+    if trading_company_balance <= 0.0 {
+        info!("No service tokens found in trading treasury. Skipping burn sequence.");
+        return Ok(());
+    }
 
-    info!(target_burn_rate = %format!("{:.1}%", burn_rate * 100.0), "Calculating ecosystem service revenue accumulation");
+    let market_input = build_market_policy_input(trading_company_balance);
+    let decision = calculate_daily_burn_decision(market_input);
 
-    // Fetch the total SPL-token balance currently residing inside the Trading Company Wallet
+    info!(
+        burn_rate_percent = %format!("{:.2}%", decision.burn_rate_percent),
+        reason = %decision.reason,
+        market_health_score = %decision.market_health_score,
+        liquidity_score = %decision.liquidity_score,
+        utility_usage_score = %decision.utility_usage_score,
+        holder_pressure_score = %decision.holder_pressure_score,
+        trading_company_wallet_score = %decision.trading_company_wallet_score,
+        "Daily Pera-X burn policy decision declared"
+    );
+
+    let tokens_to_burn = trading_company_balance * decision.burn_rate;
+    info!(
+        accumulated_balance = %trading_company_balance,
+        tokens_to_burn = %tokens_to_burn,
+        "Executing token burn transaction on Solana"
+    );
+
+    // In production, this should create and sign an SPL-Token burn instruction
+    // from the Trading Company token account and submit it via Solana RPC.
+    let tx_signature = "MOCK_SOLANA_BURN_SIGNATURE_HASH";
+
+    info!(
+        signature = %tx_signature,
+        burned_amount = %tokens_to_burn,
+        burn_rate_percent = %format!("{:.2}%", decision.burn_rate_percent),
+        "Daily burn successfully finalized on-chain"
+    );
+
+    Ok(())
+}
+
+async fn fetch_trading_company_token_balance(state: &AppState) -> Result<f64, GatewayError> {
     let balance_payload = json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -64,39 +96,44 @@ async fn execute_daily_revenue_burn(state: &AppState) -> Result<(), GatewayError
         .await?;
 
     let resp_data: serde_json::Value = response.json().await?;
-    let raw_balance = resp_data["result"]["value"]["uiAmount"]
+    Ok(resp_data["result"]["value"]["uiAmount"]
         .as_f64()
-        .unwrap_or(0.0);
-
-    if raw_balance <= 0.0 {
-        info!("No service tokens found in trading treasury. Skipping burn sequence.");
-        return Ok(());
-    }
-
-    let tokens_to_burn = raw_balance * burn_rate;
-    info!(accumulated_balance = %raw_balance, tokens_to_burn = %tokens_to_burn, "Executing token burn transaction on Solana");
-
-    // In production, your Rust engine creates an SPL-Token 'burn' instruction,
-    // signs it using your encrypted Trading Company secret key, and sends it via sendTransaction RPC.
-    let tx_signature = "MOCK_SOLANA_BURN_SIGNATURE_HASH";
-
-    info!(
-        signature = %tx_signature,
-        burned_amount = %tokens_to_burn,
-        "Daily burn successfully finalized on-chain"
-    );
-
-    Ok(())
+        .unwrap_or(0.0))
 }
 
-/// Monitors the open DEX pool price. If price breaches the 200% growth tier ($0.00027),
-/// it triggers a calculated liquidity release to stabilize volatility.
+fn build_market_policy_input(trading_company_balance: f64) -> MarketPolicyInput {
+    // TODO: Replace these baseline scores with real data from:
+    // - DEX pool/liquidity feeds
+    // - utility transaction volume
+    // - holder analytics
+    // - Trading Company wallet health thresholds
+    // - treasury and revenue dashboards
+    let trading_company_wallet_score = if trading_company_balance >= 1_000_000.0 {
+        1.0
+    } else if trading_company_balance >= 100_000.0 {
+        0.7
+    } else if trading_company_balance >= 10_000.0 {
+        0.4
+    } else {
+        0.2
+    };
+
+    MarketPolicyInput {
+        market_health_score: 0.70,
+        liquidity_score: 0.60,
+        utility_usage_score: 0.50,
+        holder_pressure_score: 0.50,
+        trading_company_wallet_score,
+    }
+}
+
+/// Monitors the open DEX pool price. If price breaches the policy threshold,
+/// it can trigger calculated liquidity support or market-condition-based unlocking.
 async fn evaluate_market_stabilization(_state: &AppState) -> Result<(), GatewayError> {
-    // Query your target DEX pool price (e.g., fetching PEX/USDC pool state from Meteora or Jupiter)
-    // For engineering fallback, we simulate a mock price validation
-    let current_dex_price = 0.00012; // Current market price tracking index
-    let launch_price = 0.00009; // Baseline target launch price
-    let target_ceiling = 0.00027; // 200% expansion ceiling threshold
+    // Query target DEX pool price in production, for example Meteora/Jupiter route pricing.
+    let current_dex_price = 0.00012;
+    let launch_price = 0.00009;
+    let target_ceiling = launch_price * 3.0;
 
     info!(
         price = %current_dex_price,
@@ -108,21 +145,19 @@ async fn evaluate_market_stabilization(_state: &AppState) -> Result<(), GatewayE
     if current_dex_price >= target_ceiling {
         warn!(
             price = %current_dex_price,
-            "Price ceiling crossed! Injecting algorithmic liquidity moderation buffers"
+            "Price ceiling crossed. Market-condition unlock review required."
         );
 
-        // Calculate maximum 10% release allocation from vested treasury supply as allowed under rules
+        // Unlocking does not mean selling. This should become a policy-reviewed movement
+        // from locked allocation wallets toward Trading Company, liquidity, or reserve support.
         let max_release_allowance = 100_000.0;
-
-        // Capped supply release split: 5% explicitly routed to Trading Company account for market backing
-        let operational_support_injection = max_release_allowance * 0.05;
+        let trading_company_share = max_release_allowance * 0.50;
 
         info!(
-            injection_volume = %operational_support_injection,
-            "Moving stabilization supply to Trading Company Liquidity bins"
+            release_allowance = %max_release_allowance,
+            trading_company_share = %trading_company_share,
+            "Calculated conditional unlock review allocation"
         );
-
-        // Execute programmatic on-chain token split distribution...
     } else {
         info!(
             "Market fluctuations remaining healthy within expected standard volatility boundaries."
