@@ -6,7 +6,7 @@ Axum 0.8 service scaffold for high-throughput WebRTC signaling, Solana settlemen
 
 - `src/domains/auth`: virtual API key extraction and account verification.
 - `src/domains/b2b_gateway`: Claude and Copyleaks proxy entrypoints.
-- `src/domains/payments`: utility payment confirmation, grant flow, and admin test routes.
+- `src/domains/payments`: utility payment confirmation, grant flow, Trading Company status, and admin test routes.
 - `src/domains/solana`: background treasury listener, dynamic burn policy, payment event ingestion, and settlement burner workers.
 - `src/domains/telecom`: Telnyx-facing voice, WebRTC, and SMS routes.
 - `src/infra`: PostgreSQL and Redis connection setup.
@@ -50,6 +50,14 @@ Example environment value:
 TRADING_CO_TREASURY=replace-with-trading-company-spl-token-account
 ```
 
+Trading Company status endpoint:
+
+```text
+GET /admin/api/trading-company-status
+```
+
+This endpoint confirms whether `TRADING_CO_TREASURY` is still a placeholder or has been replaced with a real Trading Company SPL token account.
+
 ## Burn Execution Policy
 
 Pera-X uses a controlled burn workflow:
@@ -82,6 +90,7 @@ Payment status becomes granted
 Utility payment admin/test endpoints:
 
 ```text
+GET  /admin/api/trading-company-status
 GET  /admin/api/utility-payments
 POST /admin/api/utility-payments/ingest
 POST /admin/api/utility-payments/grant
@@ -160,6 +169,7 @@ The script will call:
 
 ```text
 /healthz
+/admin/api/trading-company-status
 /admin/api/utility-payments/ingest
 /admin/api/utility-payments/grant
 /admin/api/utility-payments
