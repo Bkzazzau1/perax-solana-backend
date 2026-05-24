@@ -6,7 +6,8 @@ Axum 0.8 service scaffold for high-throughput WebRTC signaling, Solana settlemen
 
 - `src/domains/auth`: virtual API key extraction and account verification.
 - `src/domains/b2b_gateway`: Claude and Copyleaks proxy entrypoints.
-- `src/domains/solana`: background treasury listener, dynamic burn policy, and settlement burner workers.
+- `src/domains/payments`: utility payment confirmation, grant flow, and admin test routes.
+- `src/domains/solana`: background treasury listener, dynamic burn policy, payment event ingestion, and settlement burner workers.
 - `src/domains/telecom`: Telnyx-facing voice, WebRTC, and SMS routes.
 - `src/infra`: PostgreSQL and Redis connection setup.
 - `scripts`: local helper scripts for runtime testing.
@@ -37,6 +38,34 @@ approved = execute only decisions already marked as approved
 ```
 
 Use `manual` for development and early testing. Use `approved` only when production wallets, approval controls, and real SPL burn execution are ready.
+
+## Utility Payment Confirmation Flow
+
+The smart contract sends Pera-X utility payments to the Trading Company token account and emits a reference. The backend stores and confirms that reference before granting service access.
+
+```text
+User pays Pera-X on-chain
+        ↓
+Smart contract sends tokens to Trading Company wallet
+        ↓
+Backend ingests the utility payment reference
+        ↓
+Payment status becomes confirmed
+        ↓
+Backend grants the requested service/access
+        ↓
+Payment status becomes granted
+```
+
+Utility payment admin/test endpoints:
+
+```text
+GET  /admin/api/utility-payments
+POST /admin/api/utility-payments/ingest
+POST /admin/api/utility-payments/grant
+```
+
+These routes are for controlled testing and admin operations before full Solana event parsing is connected.
 
 ## Local Run
 
@@ -95,3 +124,31 @@ BASE_URL="http://127.0.0.1:8080" ./scripts/test-burn-admin.sh
 ```
 
 This test declares and approves a safe test burn decision. It does not execute real token burning while `BURN_EXECUTION_MODE=manual`.
+
+## Runtime Utility Payment Test
+
+After the backend is running locally, use the helper script to test the utility payment confirmation flow:
+
+```bash
+chmod +x scripts/test-utility-payments.sh
+./scripts/test-utility-payments.sh
+```
+
+The script will call:
+
+```text
+/healthz
+/admin/api/utility-payments/ingest
+/admin/api/utility-payments/grant
+/admin/api/utility-payments
+```
+
+You can also set a custom backend URL or custom payment reference:
+
+```bash
+BASE_URL="http://127.0.0.1:8080" \
+REFERENCE_HEX="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+./scripts/test-utility-payments.sh
+```
+
+This test ingests a safe admin utility payment, marks it as granted, and lists granted payments. It does not require real token movement while testing locally or in CI.
