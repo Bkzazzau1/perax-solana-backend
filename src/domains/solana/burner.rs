@@ -14,6 +14,7 @@ pub fn spawn_daily_burner(state: AppState) {
     tokio::spawn(async move {
         info!(
             treasury = %state.trading_co_wallet.treasury_address,
+            burn_execution_mode = %state.config.burn_execution_mode.as_str(),
             "Starting production dynamic burn and market stabilization engine"
         );
 
@@ -29,8 +30,15 @@ pub fn spawn_daily_burner(state: AppState) {
             }
 
             // 2. APPROVED BURN EXECUTION
-            if let Err(err) = execute_approved_burn_decisions(&state).await {
-                error!(error = %err, "Failed to execute approved burn decisions");
+            if state.config.burn_execution_mode.allows_approved_execution() {
+                if let Err(err) = execute_approved_burn_decisions(&state).await {
+                    error!(error = %err, "Failed to execute approved burn decisions");
+                }
+            } else {
+                info!(
+                    burn_execution_mode = %state.config.burn_execution_mode.as_str(),
+                    "Burn execution disabled by configuration. Decisions will remain declared or approved until mode is changed."
+                );
             }
 
             // 3. ALGORITHMIC MARKET MODERATION
@@ -42,7 +50,7 @@ pub fn spawn_daily_burner(state: AppState) {
 }
 
 /// Calculates and stores the daily burn decision.
-/// It does not execute a real burn until the decision is approved.
+/// It does not execute a real burn until the decision is approved and execution mode allows it.
 async fn declare_daily_revenue_burn(state: &AppState) -> Result<(), GatewayError> {
     let trading_company_balance = fetch_trading_company_token_balance(state).await?;
 
@@ -75,6 +83,7 @@ async fn declare_daily_revenue_burn(state: &AppState) -> Result<(), GatewayError
         holder_pressure_score = %decision.holder_pressure_score,
         trading_company_wallet_score = %decision.trading_company_wallet_score,
         tokens_to_burn = %tokens_to_burn,
+        burn_execution_mode = %state.config.burn_execution_mode.as_str(),
         "Daily Pera-X burn policy decision declared and saved. Awaiting approval before execution."
     );
 
