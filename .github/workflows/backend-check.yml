@@ -71,3 +71,16 @@ jobs:
 
       - name: Check build
         run: cargo check --all-targets
+
+      - name: Runtime smoke test
+        run: |
+          cargo run > /tmp/perax-backend.log 2>&1 &
+          echo $! > /tmp/perax-backend.pid
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:8080/healthz; then
+              break
+            fi
+            sleep 2
+          done
+          chmod +x scripts/test-burn-admin.sh
+          ./scripts/test-burn-admin.sh
