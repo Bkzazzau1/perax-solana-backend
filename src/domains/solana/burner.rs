@@ -23,12 +23,17 @@ pub fn spawn_daily_burner(state: AppState) {
 
             info!("Initiating daily tokenomic validation cycle...");
 
-            // 1. DYNAMIC BURN EXECUTION
-            if let Err(err) = execute_daily_revenue_burn(&state).await {
-                error!(error = %err, "Failed to complete daily token burn sequence");
+            // 1. DYNAMIC BURN DECLARATION
+            if let Err(err) = declare_daily_revenue_burn(&state).await {
+                error!(error = %err, "Failed to complete daily token burn declaration sequence");
             }
 
-            // 2. ALGORITHMIC MARKET MODERATION
+            // 2. APPROVED BURN EXECUTION
+            if let Err(err) = execute_approved_burn_decisions(&state).await {
+                error!(error = %err, "Failed to execute approved burn decisions");
+            }
+
+            // 3. ALGORITHMIC MARKET MODERATION
             if let Err(err) = evaluate_market_stabilization(&state).await {
                 error!(error = %err, "Failed to execute market stabilization check");
             }
@@ -36,13 +41,13 @@ pub fn spawn_daily_burner(state: AppState) {
     });
 }
 
-/// Calculates the approved daily burn decision and burns the required percentage
-/// of tokens collected inside the Trading Company revenue wallet.
-async fn execute_daily_revenue_burn(state: &AppState) -> Result<(), GatewayError> {
+/// Calculates and stores the daily burn decision.
+/// It does not execute a real burn until the decision is approved.
+async fn declare_daily_revenue_burn(state: &AppState) -> Result<(), GatewayError> {
     let trading_company_balance = fetch_trading_company_token_balance(state).await?;
 
     if trading_company_balance <= 0.0 {
-        info!("No service tokens found in trading treasury. Skipping burn sequence.");
+        info!("No service tokens found in trading treasury. Skipping burn declaration.");
         return Ok(());
     }
 
@@ -69,30 +74,71 @@ async fn execute_daily_revenue_burn(state: &AppState) -> Result<(), GatewayError
         utility_usage_score = %decision.utility_usage_score,
         holder_pressure_score = %decision.holder_pressure_score,
         trading_company_wallet_score = %decision.trading_company_wallet_score,
-        "Daily Pera-X burn policy decision declared and saved"
-    );
-
-    info!(
-        accumulated_balance = %trading_company_balance,
         tokens_to_burn = %tokens_to_burn,
-        "Executing token burn transaction on Solana"
-    );
-
-    // In production, this should create and sign an SPL-Token burn instruction
-    // from the Trading Company token account and submit it via Solana RPC.
-    let tx_signature = "MOCK_SOLANA_BURN_SIGNATURE_HASH";
-
-    mark_burn_decision_executed(state, decision_id, tx_signature).await?;
-
-    info!(
-        decision_id = %decision_id,
-        signature = %tx_signature,
-        burned_amount = %tokens_to_burn,
-        burn_rate_percent = %format!("{:.2}%", decision.burn_rate_percent),
-        "Daily burn successfully finalized on-chain and persisted"
+        "Daily Pera-X burn policy decision declared and saved. Awaiting approval before execution."
     );
 
     Ok(())
+}
+
+/// Executes only approved burn decisions. Declared decisions must be approved first.
+async fn execute_approved_burn_decisions(state: &AppState) -> Result<(), GatewayError> {
+    let approved_decisions = sqlx::query_as::<_, ApprovedBurnDecision>(
+        r#"
+        select
+            id,
+            tokens_to_burn::float8 as tokens_to_burn,
+            burn_rate_percent::float8 as burn_rate_percent
+        from daily_burn_decisions
+        where status = 'approved'
+        order by declared_at asc
+        limit 5
+        "#,
+    )
+    .fetch_all(&state.db)
+    .await?;
+
+    if approved_decisions.is_empty() {
+        info!("No approved Pera-X burn decisions awaiting execution.");
+        return Ok(());
+    }
+
+    for decision in approved_decisions {
+        if decision.tokens_to_burn <= 0.0 {
+            mark_burn_decision_failed(state, decision.id, "No tokens to burn").await?;
+            continue;
+        }
+
+        info!(
+            decision_id = %decision.id,
+            tokens_to_burn = %decision.tokens_to_burn,
+            burn_rate_percent = %format!("{:.2}%", decision.burn_rate_percent),
+            "Executing approved Pera-X burn decision"
+        );
+
+        // In production, this should create and sign an SPL-Token burn instruction
+        // from the Trading Company token account and submit it via Solana RPC.
+        let tx_signature = "MOCK_SOLANA_BURN_SIGNATURE_HASH";
+
+        mark_burn_decision_executed(state, decision.id, tx_signature).await?;
+
+        info!(
+            decision_id = %decision.id,
+            signature = %tx_signature,
+            burned_amount = %decision.tokens_to_burn,
+            burn_rate_percent = %format!("{:.2}%", decision.burn_rate_percent),
+            "Approved daily burn finalized on-chain and persisted"
+        );
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ApprovedBurnDecision {
+    id: Uuid,
+    tokens_to_burn: f64,
+    burn_rate_percent: f64,
 }
 
 async fn persist_burn_decision(
@@ -149,10 +195,30 @@ async fn mark_burn_decision_executed(
         r#"
         update daily_burn_decisions
         set status = 'executed', tx_signature = $1, updated_at = now()
-        where id = $2
+        where id = $2 and status = 'approved'
         "#,
     )
     .bind(tx_signature)
+    .bind(decision_id)
+    .execute(&state.db)
+    .await?;
+
+    Ok(())
+}
+
+async fn mark_burn_decision_failed(
+    state: &AppState,
+    decision_id: Uuid,
+    reason: &str,
+) -> Result<(), GatewayError> {
+    sqlx::query(
+        r#"
+        update daily_burn_decisions
+        set status = 'failed', reason = concat(reason, ' | Failure: ', $1), updated_at = now()
+        where id = $2 and status = 'approved'
+        "#,
+    )
+    .bind(reason)
     .bind(decision_id)
     .execute(&state.db)
     .await?;
