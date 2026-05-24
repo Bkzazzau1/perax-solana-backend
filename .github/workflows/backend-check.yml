@@ -82,5 +82,6 @@ jobs:
             fi
             sleep 2
           done
-          chmod +x scripts/test-burn-admin.sh
+          chmod +x scripts/test-burn-admin.sh scripts/test-utility-payments.sh
           ./scripts/test-burn-admin.sh
+          ./scripts/test-utility-payments.sh
