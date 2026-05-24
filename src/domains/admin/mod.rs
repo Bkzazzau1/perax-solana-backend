@@ -4,6 +4,7 @@ use axum::{
     response::Html,
     routing::{get, post},
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -21,6 +22,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin", get(admin_panel))
         .route("/admin/api/status", get(status))
         .route("/admin/api/burn-preview", get(burn_preview))
+        .route("/admin/api/burn-decisions", get(list_burn_decisions))
         .route("/admin/api/dev-key", post(create_dev_key))
 }
 
@@ -65,6 +67,7 @@ async fn status(State(state): State<AppState>) -> GatewayResult<Json<AdminStatus
             "GET /admin",
             "GET /admin/api/status",
             "GET /admin/api/burn-preview",
+            "GET /admin/api/burn-decisions",
             "POST /admin/api/dev-key",
             "POST /v1/proxy/claude/messages",
             "POST /v1/proxy/copyleaks/scan",
@@ -125,6 +128,73 @@ async fn burn_preview(Query(query): Query<BurnPreviewQuery>) -> Json<BurnPreview
 }
 
 #[derive(Debug, Deserialize)]
+struct BurnDecisionListQuery {
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+struct BurnDecisionRecord {
+    id: Uuid,
+    declared_at: DateTime<Utc>,
+    burn_rate: f64,
+    burn_rate_percent: f64,
+    market_health_score: f64,
+    liquidity_score: f64,
+    utility_usage_score: f64,
+    holder_pressure_score: f64,
+    trading_company_wallet_score: f64,
+    trading_company_balance: f64,
+    tokens_to_burn: f64,
+    reason: String,
+    tx_signature: Option<String>,
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BurnDecisionListResponse {
+    count: usize,
+    decisions: Vec<BurnDecisionRecord>,
+}
+
+async fn list_burn_decisions(
+    State(state): State<AppState>,
+    Query(query): Query<BurnDecisionListQuery>,
+) -> GatewayResult<Json<BurnDecisionListResponse>> {
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
+
+    let decisions = sqlx::query_as::<_, BurnDecisionRecord>(
+        r#"
+        select
+            id,
+            declared_at,
+            burn_rate::float8 as burn_rate,
+            burn_rate_percent::float8 as burn_rate_percent,
+            market_health_score::float8 as market_health_score,
+            liquidity_score::float8 as liquidity_score,
+            utility_usage_score::float8 as utility_usage_score,
+            holder_pressure_score::float8 as holder_pressure_score,
+            trading_company_wallet_score::float8 as trading_company_wallet_score,
+            trading_company_balance::float8 as trading_company_balance,
+            tokens_to_burn::float8 as tokens_to_burn,
+            reason,
+            tx_signature,
+            status
+        from daily_burn_decisions
+        order by declared_at desc
+        limit $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(Json(BurnDecisionListResponse {
+        count: decisions.len(),
+        decisions,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateDevKeyRequest {
     name: Option<String>,
     credits: Option<f64>,
@@ -179,6 +249,7 @@ async fn create_dev_key(
         sample_curl: json!({
             "health": "curl http://127.0.0.1:8080/healthz",
             "burn_preview": "curl http://127.0.0.1:8080/admin/api/burn-preview",
+            "burn_decisions": "curl http://127.0.0.1:8080/admin/api/burn-decisions",
             "copyleaks": format!("curl -X POST http://127.0.0.1:8080/v1/proxy/copyleaks/scan -H \"Authorization: Bearer {api_key}\" -H \"Content-Type: application/json\" -d \"{{\\\"text\\\":\\\"hello from pera x local admin\\\"}}\"")
         }),
     }))
@@ -295,6 +366,7 @@ const ADMIN_HTML: &str = r#"<!doctype html>
       <a href="/healthz">Health</a>
       <a href="/admin/api/status">Status JSON</a>
       <a href="/admin/api/burn-preview">Burn Preview</a>
+      <a href="/admin/api/burn-decisions">Burn Decisions</a>
     </nav>
     <section>
       <div class="grid">
