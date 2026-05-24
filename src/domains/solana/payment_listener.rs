@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::types::BigDecimal;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -12,7 +11,7 @@ pub struct UtilityPaymentEvent {
     pub payer_wallet: Option<String>,
     pub token_mint: Option<String>,
     pub trading_company_token_account: String,
-    pub amount: BigDecimal,
+    pub amount: f64,
     pub source: String,
     pub service_code: Option<String>,
     pub tx_signature: Option<String>,
