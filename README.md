@@ -28,6 +28,28 @@ The current Anchor program id is still the starter placeholder:
 
 Install the Solana and Anchor CLIs, then run `anchor keys sync` and `anchor build` in the Anchor workspace. After that, copy the real program id into `PERAX_PROGRAM_ID` in `.env`.
 
+## Trading Company SPL Token Account
+
+`TRADING_CO_TREASURY` must be the **Trading Company SPL token account** that holds Pera-X tokens.
+
+It is **not** the normal wallet address. On Solana, the wallet owner controls one or more SPL token accounts. For Pera-X utility flow, the backend needs the SPL token account that receives, holds, and later burns approved Pera-X tokens.
+
+This account is used for:
+
+```text
+1. Confirming Pera-X utility payments
+2. Matching payments sent by the smart contract
+3. Holding Trading Company utility tokens
+4. Approved burn execution from Trading Company balance
+5. Future buyback/top-up tracking
+```
+
+Example environment value:
+
+```env
+TRADING_CO_TREASURY=replace-with-trading-company-spl-token-account
+```
+
 ## Burn Execution Policy
 
 Pera-X uses a controlled burn workflow:
@@ -46,7 +68,7 @@ The smart contract sends Pera-X utility payments to the Trading Company token ac
 ```text
 User pays Pera-X on-chain
         ↓
-Smart contract sends tokens to Trading Company wallet
+Smart contract sends tokens to Trading Company SPL token account
         ↓
 Backend ingests the utility payment reference
         ↓
@@ -79,7 +101,7 @@ Set the required environment values:
 
 ```powershell
 $env:DATABASE_URL="postgres://postgres:postgres@localhost:5432/perax"
-$env:TRADING_CO_TREASURY="treasury-public-key"
+$env:TRADING_CO_TREASURY="replace-with-trading-company-spl-token-account"
 $env:JWT_SECRET="replace-with-at-least-32-characters"
 $env:BURN_EXECUTION_MODE="manual"
 cargo run
