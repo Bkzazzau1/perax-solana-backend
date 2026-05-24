@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::{
     common::crypto::{generate_virtual_key, hash_api_key, key_prefix},
     domains::solana::policy::{DailyBurnDecision, MarketPolicyInput, calculate_daily_burn_decision},
-    error::GatewayResult,
+    error::{GatewayError, GatewayResult},
     infra::cache::{self, CacheStore},
     state::AppState,
 };
@@ -24,6 +24,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/api/burn-preview", get(burn_preview))
         .route("/admin/api/burn-decisions", get(list_burn_decisions))
         .route("/admin/api/burn-decisions/declare", post(declare_burn_decision))
+        .route("/admin/api/burn-decisions/status", post(update_burn_decision_status))
         .route("/admin/api/dev-key", post(create_dev_key))
 }
 
@@ -70,6 +71,7 @@ async fn status(State(state): State<AppState>) -> GatewayResult<Json<AdminStatus
             "GET /admin/api/burn-preview",
             "GET /admin/api/burn-decisions",
             "POST /admin/api/burn-decisions/declare",
+            "POST /admin/api/burn-decisions/status",
             "POST /admin/api/dev-key",
             "POST /v1/proxy/claude/messages",
             "POST /v1/proxy/copyleaks/scan",
@@ -284,6 +286,64 @@ async fn declare_burn_decision(
 }
 
 #[derive(Debug, Deserialize)]
+struct UpdateBurnDecisionStatusRequest {
+    id: Uuid,
+    status: String,
+    tx_signature: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateBurnDecisionStatusResponse {
+    id: Uuid,
+    status: String,
+    tx_signature: Option<String>,
+    updated: bool,
+}
+
+async fn update_burn_decision_status(
+    State(state): State<AppState>,
+    Json(request): Json<UpdateBurnDecisionStatusRequest>,
+) -> GatewayResult<Json<UpdateBurnDecisionStatusResponse>> {
+    let status = request.status.trim().to_lowercase();
+    if !is_allowed_burn_status(&status) {
+        return Err(GatewayError::Upstream(format!(
+            "invalid burn decision status: {status}"
+        )));
+    }
+
+    let result = sqlx::query(
+        r#"
+        update daily_burn_decisions
+        set status = $1, tx_signature = coalesce($2, tx_signature), updated_at = now()
+        where id = $3
+        "#,
+    )
+    .bind(&status)
+    .bind(request.tx_signature.as_deref())
+    .bind(request.id)
+    .execute(&state.db)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(GatewayError::Upstream(format!(
+            "burn decision not found: {}",
+            request.id
+        )));
+    }
+
+    Ok(Json(UpdateBurnDecisionStatusResponse {
+        id: request.id,
+        status,
+        tx_signature: request.tx_signature,
+        updated: true,
+    }))
+}
+
+fn is_allowed_burn_status(status: &str) -> bool {
+    matches!(status, "declared" | "approved" | "executed" | "failed" | "cancelled")
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateDevKeyRequest {
     name: Option<String>,
     credits: Option<f64>,
@@ -340,6 +400,8 @@ async fn create_dev_key(
             "burn_preview": "curl http://127.0.0.1:8080/admin/api/burn-preview",
             "burn_decisions": "curl http://127.0.0.1:8080/admin/api/burn-decisions",
             "declare_burn": "curl -X POST http://127.0.0.1:8080/admin/api/burn-decisions/declare -H 'Content-Type: application/json' -d '{\"trading_company_balance\":100000,\"utility_usage_score\":0.2,\"holder_pressure_score\":0.9}'",
+            "approve_burn": "curl -X POST http://127.0.0.1:8080/admin/api/burn-decisions/status -H 'Content-Type: application/json' -d '{\"id\":\"DECISION_ID\",\"status\":\"approved\"}'",
+            "cancel_burn": "curl -X POST http://127.0.0.1:8080/admin/api/burn-decisions/status -H 'Content-Type: application/json' -d '{\"id\":\"DECISION_ID\",\"status\":\"cancelled\"}'",
             "copyleaks": format!("curl -X POST http://127.0.0.1:8080/v1/proxy/copyleaks/scan -H \"Authorization: Bearer {api_key}\" -H \"Content-Type: application/json\" -d \"{{\\\"text\\\":\\\"hello from pera x local admin\\\"}}\"")
         }),
     }))
