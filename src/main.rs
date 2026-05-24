@@ -27,6 +27,7 @@ async fn main() -> GatewayResult<()> {
         .route("/", get(root))
         .route("/healthz", get(healthz))
         .merge(domains::admin::router())
+        .merge(domains::payments::router())
         .merge(domains::b2b_gateway::router())
         .merge(domains::telecom::routes::router())
         .layer(CorsLayer::permissive())
