@@ -1,3 +1,23 @@
+# Rust build output
 /target
-.env
 target/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local database/cache files
+*.sqlite
+*.sqlite3
+dump.rdb
