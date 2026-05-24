@@ -5,7 +5,9 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    domains::solana::policy::{calculate_daily_burn_decision, DailyBurnDecision, MarketPolicyInput},
+    domains::solana::policy::{
+        DailyBurnDecision, MarketPolicyInput, calculate_daily_burn_decision,
+    },
     error::GatewayError,
     state::AppState,
 };
