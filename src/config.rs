@@ -2,6 +2,35 @@ use std::{env, net::SocketAddr};
 
 use crate::error::{GatewayError, GatewayResult};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BurnExecutionMode {
+    Manual,
+    Approved,
+}
+
+impl BurnExecutionMode {
+    pub fn from_env_value(value: &str) -> GatewayResult<Self> {
+        match value.trim().to_lowercase().as_str() {
+            "manual" => Ok(Self::Manual),
+            "approved" => Ok(Self::Approved),
+            other => Err(GatewayError::Config(format!(
+                "BURN_EXECUTION_MODE must be either 'manual' or 'approved', got '{other}'"
+            ))),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Approved => "approved",
+        }
+    }
+
+    pub fn allows_approved_execution(&self) -> bool {
+        matches!(self, Self::Approved)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub host: String,
@@ -13,6 +42,7 @@ pub struct Config {
     pub perax_anchor_workspace: String,
     pub perax_program_id: String,
     pub trading_co_treasury: String,
+    pub burn_execution_mode: BurnExecutionMode,
     pub jwt_secret: String,
     pub claude_base_url: String,
     pub copyleaks_base_url: String,
@@ -21,6 +51,9 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> GatewayResult<Self> {
+        let burn_execution_mode =
+            BurnExecutionMode::from_env_value(&env_or("BURN_EXECUTION_MODE", "manual"))?;
+
         let config = Self {
             host: env_or("HOST", "0.0.0.0"),
             port: parse_port()?,
@@ -34,6 +67,7 @@ impl Config {
             ),
             perax_program_id: env_or("PERAX_PROGRAM_ID", "11111111111111111111111111111111"),
             trading_co_treasury: required("TRADING_CO_TREASURY")?,
+            burn_execution_mode,
             jwt_secret: required("JWT_SECRET")?,
             claude_base_url: env_or("CLAUDE_BASE_URL", "https://api.anthropic.com"),
             copyleaks_base_url: env_or("COPYLEAKS_BASE_URL", "https://api.copyleaks.com"),
