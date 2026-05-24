@@ -9,6 +9,7 @@ Axum 0.8 service scaffold for high-throughput WebRTC signaling, Solana settlemen
 - `src/domains/solana`: background treasury listener, dynamic burn policy, and settlement burner workers.
 - `src/domains/telecom`: Telnyx-facing voice, WebRTC, and SMS routes.
 - `src/infra`: PostgreSQL and Redis connection setup.
+- `scripts`: local helper scripts for runtime testing.
 
 ## Anchor Contract Link
 
@@ -39,6 +40,12 @@ Use `manual` for development and early testing. Use `approved` only when product
 
 ## Local Run
 
+Copy the environment template:
+
+```bash
+cp .env.example .env
+```
+
 Set the required environment values:
 
 ```powershell
@@ -61,3 +68,30 @@ POST /admin/api/burn-decisions/status
 ```
 
 These endpoints let the team preview burn decisions, declare test decisions, review history, and approve/cancel decisions before real execution is enabled.
+
+## Runtime Burn Admin Test
+
+After the backend is running locally, use the helper script to test the admin burn flow:
+
+```bash
+chmod +x scripts/test-burn-admin.sh
+./scripts/test-burn-admin.sh
+```
+
+The script will call:
+
+```text
+/healthz
+/admin/api/burn-preview
+/admin/api/burn-decisions/declare
+/admin/api/burn-decisions/status
+/admin/api/burn-decisions
+```
+
+You can also set a custom backend URL:
+
+```bash
+BASE_URL="http://127.0.0.1:8080" ./scripts/test-burn-admin.sh
+```
+
+This test declares and approves a safe test burn decision. It does not execute real token burning while `BURN_EXECUTION_MODE=manual`.
