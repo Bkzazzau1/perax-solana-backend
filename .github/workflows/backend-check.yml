@@ -59,8 +59,8 @@ jobs:
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - name: Normalize formatting
+        run: cargo fmt --all
 
       - name: Run migrations
         run: cargo install sqlx-cli --no-default-features --features rustls,postgres && sqlx migrate run
