@@ -18,9 +18,37 @@ use crate::{
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/admin/api/trading-company-status", get(trading_company_status))
         .route("/admin/api/utility-payments", get(list_utility_payments))
         .route("/admin/api/utility-payments/ingest", post(ingest_utility_payment))
         .route("/admin/api/utility-payments/grant", post(grant_utility_payment))
+}
+
+#[derive(Debug, Serialize)]
+struct TradingCompanyStatusResponse {
+    configured: bool,
+    spl_token_account: String,
+    warning: Option<&'static str>,
+}
+
+async fn trading_company_status(
+    State(state): State<AppState>,
+) -> Json<TradingCompanyStatusResponse> {
+    let value = state.config.trading_co_treasury.trim();
+    let configured = !value.is_empty()
+        && !value.eq_ignore_ascii_case("replace-with-trading-company-token-account")
+        && !value.eq_ignore_ascii_case("replace-with-trading-company-spl-token-account")
+        && value.len() >= 32;
+
+    Json(TradingCompanyStatusResponse {
+        configured,
+        spl_token_account: state.config.trading_co_treasury.clone(),
+        warning: if configured {
+            None
+        } else {
+            Some("TRADING_CO_TREASURY is not configured with a real Trading Company SPL token account")
+        },
+    })
 }
 
 #[derive(Debug, Deserialize)]
