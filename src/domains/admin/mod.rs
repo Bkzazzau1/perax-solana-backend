@@ -23,6 +23,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/api/status", get(status))
         .route("/admin/api/burn-preview", get(burn_preview))
         .route("/admin/api/burn-decisions", get(list_burn_decisions))
+        .route("/admin/api/burn-decisions/declare", post(declare_burn_decision))
         .route("/admin/api/dev-key", post(create_dev_key))
 }
 
@@ -68,6 +69,7 @@ async fn status(State(state): State<AppState>) -> GatewayResult<Json<AdminStatus
             "GET /admin/api/status",
             "GET /admin/api/burn-preview",
             "GET /admin/api/burn-decisions",
+            "POST /admin/api/burn-decisions/declare",
             "POST /admin/api/dev-key",
             "POST /v1/proxy/claude/messages",
             "POST /v1/proxy/copyleaks/scan",
@@ -195,6 +197,93 @@ async fn list_burn_decisions(
 }
 
 #[derive(Debug, Deserialize)]
+struct DeclareBurnDecisionRequest {
+    trading_company_balance: Option<f64>,
+    market_health_score: Option<f64>,
+    liquidity_score: Option<f64>,
+    utility_usage_score: Option<f64>,
+    holder_pressure_score: Option<f64>,
+    trading_company_wallet_score: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeclareBurnDecisionResponse {
+    id: Uuid,
+    status: &'static str,
+    trading_company_balance: f64,
+    tokens_to_burn: f64,
+    input: MarketPolicyInput,
+    decision: DailyBurnDecision,
+}
+
+async fn declare_burn_decision(
+    State(state): State<AppState>,
+    Json(request): Json<DeclareBurnDecisionRequest>,
+) -> GatewayResult<Json<DeclareBurnDecisionResponse>> {
+    let defaults = MarketPolicyInput::default();
+    let trading_company_balance = request.trading_company_balance.unwrap_or(0.0).max(0.0);
+
+    let input = MarketPolicyInput {
+        market_health_score: request
+            .market_health_score
+            .unwrap_or(defaults.market_health_score),
+        liquidity_score: request.liquidity_score.unwrap_or(defaults.liquidity_score),
+        utility_usage_score: request
+            .utility_usage_score
+            .unwrap_or(defaults.utility_usage_score),
+        holder_pressure_score: request
+            .holder_pressure_score
+            .unwrap_or(defaults.holder_pressure_score),
+        trading_company_wallet_score: request
+            .trading_company_wallet_score
+            .unwrap_or(defaults.trading_company_wallet_score),
+    };
+
+    let decision = calculate_daily_burn_decision(input.clone());
+    let tokens_to_burn = trading_company_balance * decision.burn_rate;
+
+    let id = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        insert into daily_burn_decisions (
+            burn_rate,
+            burn_rate_percent,
+            market_health_score,
+            liquidity_score,
+            utility_usage_score,
+            holder_pressure_score,
+            trading_company_wallet_score,
+            trading_company_balance,
+            tokens_to_burn,
+            reason,
+            status
+        ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'declared')
+        returning id
+        "#,
+    )
+    .bind(decision.burn_rate)
+    .bind(decision.burn_rate_percent)
+    .bind(decision.market_health_score)
+    .bind(decision.liquidity_score)
+    .bind(decision.utility_usage_score)
+    .bind(decision.holder_pressure_score)
+    .bind(decision.trading_company_wallet_score)
+    .bind(trading_company_balance)
+    .bind(tokens_to_burn)
+    .bind(&decision.reason)
+    .fetch_one(&state.db)
+    .await?;
+
+    Ok(Json(DeclareBurnDecisionResponse {
+        id,
+        status: "declared",
+        trading_company_balance,
+        tokens_to_burn,
+        input,
+        decision,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateDevKeyRequest {
     name: Option<String>,
     credits: Option<f64>,
@@ -250,6 +339,7 @@ async fn create_dev_key(
             "health": "curl http://127.0.0.1:8080/healthz",
             "burn_preview": "curl http://127.0.0.1:8080/admin/api/burn-preview",
             "burn_decisions": "curl http://127.0.0.1:8080/admin/api/burn-decisions",
+            "declare_burn": "curl -X POST http://127.0.0.1:8080/admin/api/burn-decisions/declare -H 'Content-Type: application/json' -d '{\"trading_company_balance\":100000,\"utility_usage_score\":0.2,\"holder_pressure_score\":0.9}'",
             "copyleaks": format!("curl -X POST http://127.0.0.1:8080/v1/proxy/copyleaks/scan -H \"Authorization: Bearer {api_key}\" -H \"Content-Type: application/json\" -d \"{{\\\"text\\\":\\\"hello from pera x local admin\\\"}}\"")
         }),
     }))
