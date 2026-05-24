@@ -1,5 +1,6 @@
 use axum::{
     Json, Router,
+    extract::{Query, State},
     response::Html,
     routing::{get, post},
 };
@@ -9,6 +10,7 @@ use uuid::Uuid;
 
 use crate::{
     common::crypto::{generate_virtual_key, hash_api_key, key_prefix},
+    domains::solana::policy::{DailyBurnDecision, MarketPolicyInput, calculate_daily_burn_decision},
     error::GatewayResult,
     infra::cache::{self, CacheStore},
     state::AppState,
@@ -18,6 +20,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/admin", get(admin_panel))
         .route("/admin/api/status", get(status))
+        .route("/admin/api/burn-preview", get(burn_preview))
         .route("/admin/api/dev-key", post(create_dev_key))
 }
 
@@ -37,9 +40,7 @@ struct AdminStatus {
     routes: Vec<&'static str>,
 }
 
-async fn status(
-    axum::extract::State(state): axum::extract::State<AppState>,
-) -> GatewayResult<Json<AdminStatus>> {
+async fn status(State(state): State<AppState>) -> GatewayResult<Json<AdminStatus>> {
     let accounts = sqlx::query_scalar::<_, i64>("select count(*) from accounts")
         .fetch_one(&state.db)
         .await?;
@@ -62,6 +63,8 @@ async fn status(
         routes: vec![
             "GET /healthz",
             "GET /admin",
+            "GET /admin/api/status",
+            "GET /admin/api/burn-preview",
             "POST /admin/api/dev-key",
             "POST /v1/proxy/claude/messages",
             "POST /v1/proxy/copyleaks/scan",
@@ -72,6 +75,53 @@ async fn status(
             "POST /telecom/numbers/buy",
         ],
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct BurnPreviewQuery {
+    market_health_score: Option<f64>,
+    liquidity_score: Option<f64>,
+    utility_usage_score: Option<f64>,
+    holder_pressure_score: Option<f64>,
+    trading_company_wallet_score: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct BurnPreviewResponse {
+    policy: &'static str,
+    min_burn_percent: f64,
+    max_burn_percent: f64,
+    input: MarketPolicyInput,
+    decision: DailyBurnDecision,
+}
+
+async fn burn_preview(Query(query): Query<BurnPreviewQuery>) -> Json<BurnPreviewResponse> {
+    let defaults = MarketPolicyInput::default();
+    let input = MarketPolicyInput {
+        market_health_score: query
+            .market_health_score
+            .unwrap_or(defaults.market_health_score),
+        liquidity_score: query.liquidity_score.unwrap_or(defaults.liquidity_score),
+        utility_usage_score: query
+            .utility_usage_score
+            .unwrap_or(defaults.utility_usage_score),
+        holder_pressure_score: query
+            .holder_pressure_score
+            .unwrap_or(defaults.holder_pressure_score),
+        trading_company_wallet_score: query
+            .trading_company_wallet_score
+            .unwrap_or(defaults.trading_company_wallet_score),
+    };
+
+    let decision = calculate_daily_burn_decision(input.clone());
+
+    Json(BurnPreviewResponse {
+        policy: "Pera-X dynamic daily burn policy",
+        min_burn_percent: 2.0,
+        max_burn_percent: 30.0,
+        input,
+        decision,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,7 +140,7 @@ struct CreateDevKeyResponse {
 }
 
 async fn create_dev_key(
-    axum::extract::State(state): axum::extract::State<AppState>,
+    State(state): State<AppState>,
     Json(request): Json<CreateDevKeyRequest>,
 ) -> GatewayResult<Json<CreateDevKeyResponse>> {
     let name = request
@@ -128,6 +178,7 @@ async fn create_dev_key(
         credits,
         sample_curl: json!({
             "health": "curl http://127.0.0.1:8080/healthz",
+            "burn_preview": "curl http://127.0.0.1:8080/admin/api/burn-preview",
             "copyleaks": format!("curl -X POST http://127.0.0.1:8080/v1/proxy/copyleaks/scan -H \"Authorization: Bearer {api_key}\" -H \"Content-Type: application/json\" -d \"{{\\\"text\\\":\\\"hello from pera x local admin\\\"}}\"")
         }),
     }))
@@ -243,6 +294,7 @@ const ADMIN_HTML: &str = r#"<!doctype html>
       <a class="active" href="/admin">Overview</a>
       <a href="/healthz">Health</a>
       <a href="/admin/api/status">Status JSON</a>
+      <a href="/admin/api/burn-preview">Burn Preview</a>
     </nav>
     <section>
       <div class="grid">
