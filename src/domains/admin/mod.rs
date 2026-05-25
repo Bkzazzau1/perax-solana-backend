@@ -11,7 +11,9 @@ use uuid::Uuid;
 
 use crate::{
     common::crypto::{generate_virtual_key, hash_api_key, key_prefix},
-    domains::solana::policy::{DailyBurnDecision, MarketPolicyInput, calculate_daily_burn_decision},
+    domains::solana::policy::{
+        DailyBurnDecision, MarketPolicyInput, calculate_daily_burn_decision,
+    },
     error::{GatewayError, GatewayResult},
     infra::cache::{self, CacheStore},
     state::AppState,
@@ -23,8 +25,14 @@ pub fn router() -> Router<AppState> {
         .route("/admin/api/status", get(status))
         .route("/admin/api/burn-preview", get(burn_preview))
         .route("/admin/api/burn-decisions", get(list_burn_decisions))
-        .route("/admin/api/burn-decisions/declare", post(declare_burn_decision))
-        .route("/admin/api/burn-decisions/status", post(update_burn_decision_status))
+        .route(
+            "/admin/api/burn-decisions/declare",
+            post(declare_burn_decision),
+        )
+        .route(
+            "/admin/api/burn-decisions/status",
+            post(update_burn_decision_status),
+        )
         .route("/admin/api/dev-key", post(create_dev_key))
 }
 
@@ -340,7 +348,10 @@ async fn update_burn_decision_status(
 }
 
 fn is_allowed_burn_status(status: &str) -> bool {
-    matches!(status, "declared" | "approved" | "executed" | "failed" | "cancelled")
+    matches!(
+        status,
+        "declared" | "approved" | "executed" | "failed" | "cancelled"
+    )
 }
 
 #[derive(Debug, Deserialize)]

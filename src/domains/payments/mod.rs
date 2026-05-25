@@ -18,10 +18,19 @@ use crate::{
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/admin/api/trading-company-status", get(trading_company_status))
+        .route(
+            "/admin/api/trading-company-status",
+            get(trading_company_status),
+        )
         .route("/admin/api/utility-payments", get(list_utility_payments))
-        .route("/admin/api/utility-payments/ingest", post(ingest_utility_payment))
-        .route("/admin/api/utility-payments/grant", post(grant_utility_payment))
+        .route(
+            "/admin/api/utility-payments/ingest",
+            post(ingest_utility_payment),
+        )
+        .route(
+            "/admin/api/utility-payments/grant",
+            post(grant_utility_payment),
+        )
 }
 
 #[derive(Debug, Serialize)]
@@ -46,7 +55,9 @@ async fn trading_company_status(
         warning: if configured {
             None
         } else {
-            Some("TRADING_CO_TREASURY is not configured with a real Trading Company SPL token account")
+            Some(
+                "TRADING_CO_TREASURY is not configured with a real Trading Company SPL token account",
+            )
         },
     })
 }
