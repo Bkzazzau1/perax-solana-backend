@@ -5,7 +5,6 @@ use axum::{Router, routing::post};
 
 use crate::state::AppState;
 
-/// Mounts and exposes the Codex B2B Utility API Proxy routes to the main application server.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
