@@ -12,6 +12,8 @@ use crate::{
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/telecom/call/{id}", get(voice::get_call))
+        .route("/telecom/calls/start", post(voice::start_call_session))
+        .route("/telecom/calls/end", post(voice::end_call_session))
         .route("/telecom/webrtc/offer", post(voice::create_offer))
         .route("/telecom/sms", post(sms::send_sms))
         .route(
