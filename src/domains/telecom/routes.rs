@@ -20,5 +20,9 @@ pub fn router() -> Router<AppState> {
             "/telecom/numbers/search",
             get(inventory::search_global_numbers),
         )
+        .route(
+            "/telecom/numbers/reserve",
+            post(inventory::reserve_number_with_credits),
+        )
         .route("/telecom/numbers/buy", post(inventory::purchase_number))
 }
