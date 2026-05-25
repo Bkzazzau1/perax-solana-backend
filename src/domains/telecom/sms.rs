@@ -48,7 +48,7 @@ pub struct SmsInboxQuery {
     pub limit: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct InboundSmsMessage {
     pub id: Uuid,
@@ -87,14 +87,11 @@ pub async fn send_sms(
         ));
     }
 
-    // 1. Calculate Billing Units based on standard SMS segment lengths (160 chars)
     let parts_billed = ((body_len as f64) / 160.0).ceil() as usize;
-    let cost_per_segment = 0.02; // Internal Pera-X service credit cost metric per segment
+    let cost_per_segment = 0.02;
     let total_sms_cost = (parts_billed as f64) * cost_per_segment;
 
     let user_redis_key = format!("client:balance:{}", account.account_id);
-
-    // 2. Pre-Send Wallet Credit Check & Atomic Deduction
     let current_credits = cache::get_credits(&state.cache, &user_redis_key).await?;
 
     match current_credits {
@@ -112,7 +109,6 @@ pub async fn send_sms(
         "Pre-flight SMS balance debited, dispatching message to downstream carrier"
     );
 
-    // 3. Upstream Telnyx SMS API Target Execution
     let telnyx_sms_url = format!("{}/v2/messages", state.config.telnyx_base_url);
     let telnyx_payload = json!({
         "to": request.to,
@@ -133,7 +129,6 @@ pub async fn send_sms(
         let err_text = response.text().await.unwrap_or_default();
         tracing::error!(account_id = %account.account_id, error = %err_text, "Telnyx SMS gateway delivery rejected");
 
-        // Rollback/Refund Mechanism: Return credits if carrier fails
         cache::increment_credits(&state.cache, &user_redis_key, total_sms_cost).await?;
 
         return Err(GatewayError::Upstream(format!(
@@ -165,8 +160,7 @@ pub async fn receive_inbound_sms(
     let provider_message_id = extract_provider_message_id(&payload);
     let provider_payload = serde_json::to_value(&payload.data).unwrap_or(Value::Null);
 
-    let record = sqlx::query_as!(
-        InboundSmsMessage,
+    let record = sqlx::query_as::<_, InboundSmsMessage>(
         r#"
         insert into inbound_sms_messages (
             phone_number,
@@ -181,12 +175,12 @@ pub async fn receive_inbound_sms(
             provider_payload = excluded.provider_payload
         returning id, phone_number, sender, body, provider_message_id, received_at
         "#,
-        phone_number,
-        sender,
-        body,
-        provider_message_id,
-        provider_payload,
     )
+    .bind(phone_number)
+    .bind(sender)
+    .bind(body)
+    .bind(provider_message_id)
+    .bind(provider_payload)
     .fetch_one(&state.db)
     .await?;
 
@@ -206,8 +200,7 @@ pub async fn get_sms_inbox(
     let phone_number = normalize_phone_number(&query.phone_number)?;
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
 
-    let messages = sqlx::query_as!(
-        InboundSmsMessage,
+    let messages = sqlx::query_as::<_, InboundSmsMessage>(
         r#"
         select id, phone_number, sender, body, provider_message_id, received_at
         from inbound_sms_messages
@@ -215,9 +208,9 @@ pub async fn get_sms_inbox(
         order by received_at desc
         limit $2
         "#,
-        phone_number,
-        limit,
     )
+    .bind(&phone_number)
+    .bind(limit)
     .fetch_all(&state.db)
     .await?;
 
