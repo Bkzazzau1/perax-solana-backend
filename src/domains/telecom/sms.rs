@@ -1,7 +1,11 @@
 // src/domains/telecom/sms.rs
-use axum::{Json, extract::State};
+use axum::{
+    Json,
+    extract::{Query, State},
+};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::{
     domains::auth::middleware::AuthenticatedAccount,
@@ -23,6 +27,52 @@ pub struct SmsResponse {
     pub routed: bool,
     pub parts_billed: usize,
     pub credits_deducted: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboundSmsWebhook {
+    pub to: Option<String>,
+    pub from: Option<String>,
+    pub body: Option<String>,
+    pub text: Option<String>,
+    pub message_id: Option<String>,
+    pub provider_message_id: Option<String>,
+    pub data: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmsInboxQuery {
+    pub phone_number: String,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboundSmsMessage {
+    pub id: Uuid,
+    pub phone_number: String,
+    pub sender: String,
+    pub body: String,
+    pub provider_message_id: Option<String>,
+    pub received_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboundSmsWebhookResponse {
+    pub accepted: bool,
+    pub message_id: Uuid,
+    pub phone_number: String,
+    pub sender: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmsInboxResponse {
+    pub phone_number: String,
+    pub messages: Vec<InboundSmsMessage>,
 }
 
 pub async fn send_sms(
@@ -94,7 +144,7 @@ pub async fn send_sms(
     let resp_json: serde_json::Value = response.json().await.map_err(GatewayError::Http)?;
     let message_id = resp_json["data"]["id"]
         .as_str()
-        .unwrap_or_else(|| "unknown_carrier_id")
+        .unwrap_or("unknown_carrier_id")
         .to_string();
 
     Ok(Json(SmsResponse {
@@ -103,4 +153,199 @@ pub async fn send_sms(
         parts_billed,
         credits_deducted: total_sms_cost,
     }))
+}
+
+pub async fn receive_inbound_sms(
+    State(state): State<AppState>,
+    Json(payload): Json<InboundSmsWebhook>,
+) -> GatewayResult<Json<InboundSmsWebhookResponse>> {
+    let phone_number = extract_to_number(&payload)?;
+    let sender = extract_from_number(&payload)?;
+    let body = extract_body(&payload)?;
+    let provider_message_id = extract_provider_message_id(&payload);
+    let provider_payload = serde_json::to_value(&payload.data).unwrap_or(Value::Null);
+
+    let record = sqlx::query_as!(
+        InboundSmsMessage,
+        r#"
+        insert into inbound_sms_messages (
+            phone_number,
+            sender,
+            body,
+            provider_message_id,
+            provider_payload
+        )
+        values ($1, $2, $3, $4, $5)
+        on conflict (provider_message_id) where provider_message_id is not null do update
+        set body = excluded.body,
+            provider_payload = excluded.provider_payload
+        returning id, phone_number, sender, body, provider_message_id, received_at
+        "#,
+        phone_number,
+        sender,
+        body,
+        provider_message_id,
+        provider_payload,
+    )
+    .fetch_one(&state.db)
+    .await?;
+
+    Ok(Json(InboundSmsWebhookResponse {
+        accepted: true,
+        message_id: record.id,
+        phone_number: record.phone_number,
+        sender: record.sender,
+    }))
+}
+
+pub async fn get_sms_inbox(
+    State(state): State<AppState>,
+    _account: AuthenticatedAccount,
+    Query(query): Query<SmsInboxQuery>,
+) -> GatewayResult<Json<SmsInboxResponse>> {
+    let phone_number = normalize_phone_number(&query.phone_number)?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+
+    let messages = sqlx::query_as!(
+        InboundSmsMessage,
+        r#"
+        select id, phone_number, sender, body, provider_message_id, received_at
+        from inbound_sms_messages
+        where phone_number = $1
+        order by received_at desc
+        limit $2
+        "#,
+        phone_number,
+        limit,
+    )
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(Json(SmsInboxResponse {
+        phone_number,
+        messages,
+    }))
+}
+
+fn extract_to_number(payload: &InboundSmsWebhook) -> GatewayResult<String> {
+    if let Some(value) = payload.to.as_deref() {
+        return normalize_phone_number(value);
+    }
+
+    if let Some(value) = payload
+        .data
+        .as_ref()
+        .and_then(|data| data.get("payload"))
+        .and_then(|payload| payload.get("to"))
+        .and_then(Value::as_str)
+    {
+        return normalize_phone_number(value);
+    }
+
+    if let Some(value) = payload
+        .data
+        .as_ref()
+        .and_then(|data| data.get("to"))
+        .and_then(Value::as_str)
+    {
+        return normalize_phone_number(value);
+    }
+
+    Err(GatewayError::Upstream(
+        "Inbound SMS webhook missing recipient number".to_string(),
+    ))
+}
+
+fn extract_from_number(payload: &InboundSmsWebhook) -> GatewayResult<String> {
+    if let Some(value) = payload.from.as_deref() {
+        return normalize_phone_number(value);
+    }
+
+    if let Some(value) = payload
+        .data
+        .as_ref()
+        .and_then(|data| data.get("payload"))
+        .and_then(|payload| payload.get("from"))
+        .and_then(Value::as_str)
+    {
+        return normalize_phone_number(value);
+    }
+
+    if let Some(value) = payload
+        .data
+        .as_ref()
+        .and_then(|data| data.get("from"))
+        .and_then(Value::as_str)
+    {
+        return normalize_phone_number(value);
+    }
+
+    Err(GatewayError::Upstream(
+        "Inbound SMS webhook missing sender number".to_string(),
+    ))
+}
+
+fn extract_body(payload: &InboundSmsWebhook) -> GatewayResult<String> {
+    if let Some(value) = payload.body.as_deref().or(payload.text.as_deref()) {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Ok(value.to_string());
+        }
+    }
+
+    if let Some(value) = payload
+        .data
+        .as_ref()
+        .and_then(|data| data.get("payload"))
+        .and_then(|payload| payload.get("text"))
+        .and_then(Value::as_str)
+    {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Ok(value.to_string());
+        }
+    }
+
+    Err(GatewayError::Upstream(
+        "Inbound SMS webhook missing message body".to_string(),
+    ))
+}
+
+fn extract_provider_message_id(payload: &InboundSmsWebhook) -> Option<String> {
+    payload
+        .provider_message_id
+        .clone()
+        .or_else(|| payload.message_id.clone())
+        .or_else(|| {
+            payload
+                .data
+                .as_ref()
+                .and_then(|data| data.get("payload"))
+                .and_then(|payload| payload.get("id"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            payload
+                .data
+                .as_ref()
+                .and_then(|data| data.get("id"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+}
+
+fn normalize_phone_number(phone_number: &str) -> GatewayResult<String> {
+    let phone_number = phone_number.trim();
+    let valid = phone_number.starts_with('+')
+        && phone_number.len() <= 32
+        && phone_number.chars().skip(1).all(|ch| ch.is_ascii_digit());
+
+    if valid {
+        Ok(phone_number.to_string())
+    } else {
+        Err(GatewayError::Upstream(
+            "phone number must be in E.164 format, for example +13125551234".to_string(),
+        ))
+    }
 }
