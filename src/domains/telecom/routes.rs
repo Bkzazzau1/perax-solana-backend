@@ -16,6 +16,8 @@ pub fn router() -> Router<AppState> {
         .route("/telecom/calls/end", post(voice::end_call_session))
         .route("/telecom/webrtc/offer", post(voice::create_offer))
         .route("/telecom/sms", post(sms::send_sms))
+        .route("/telecom/sms/inbound", post(sms::receive_inbound_sms))
+        .route("/telecom/sms/inbox", get(sms::get_sms_inbox))
         .route(
             "/telecom/numbers/search",
             get(inventory::search_global_numbers),
