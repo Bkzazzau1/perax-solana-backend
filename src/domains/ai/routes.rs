@@ -1,8 +1,25 @@
 use axum::{Json, Router, routing::post};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 use crate::{error::GatewayResult, state::AppState};
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiAccessCheckRequest {
+    pub tool: AiTool,
+    pub wallet_balance: f64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiAccessCheckResponse {
+    pub allowed: bool,
+    pub tool: AiTool,
+    pub pex_cost: f64,
+    pub wallet_balance: f64,
+    pub remaining_balance: f64,
+    pub message: String,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,6 +37,16 @@ pub enum AiTool {
     AiDetector,
     PlagiarismChecker,
     Humanizer,
+}
+
+impl AiTool {
+    fn pex_cost(self) -> f64 {
+        match self {
+            Self::AiDetector => 6.0,
+            Self::PlagiarismChecker => 8.0,
+            Self::Humanizer => 10.0,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy)]
@@ -41,7 +68,30 @@ pub struct AiAnalyzeResponse {
 }
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/ai/documents/analyze", post(analyze_document))
+    Router::new()
+        .route("/ai/access/check", post(check_access))
+        .route("/ai/documents/analyze", post(analyze_document))
+}
+
+async fn check_access(
+    Json(payload): Json<AiAccessCheckRequest>,
+) -> GatewayResult<Json<AiAccessCheckResponse>> {
+    let pex_cost = payload.tool.pex_cost();
+    let remaining_balance = payload.wallet_balance - pex_cost;
+    let allowed = remaining_balance >= 0.0;
+
+    Ok(Json(AiAccessCheckResponse {
+        allowed,
+        tool: payload.tool,
+        pex_cost,
+        wallet_balance: payload.wallet_balance,
+        remaining_balance,
+        message: if allowed {
+            "Token access confirmed. AI task can continue.".to_string()
+        } else {
+            "Insufficient Pera-X balance for this AI task.".to_string()
+        },
+    }))
 }
 
 async fn analyze_document(
@@ -60,6 +110,7 @@ async fn analyze_document(
             AiInputMode::Text
         }
     });
+    let pex_cost = payload.tool.pex_cost();
 
     let response = match payload.tool {
         AiTool::AiDetector => AiAnalyzeResponse {
@@ -69,7 +120,7 @@ async fn analyze_document(
                 input_mode
             ),
             score: 72.0,
-            pex_cost: 6.0,
+            pex_cost,
             findings: vec![
                 "Predictable paragraph rhythm detected in several sections.".to_string(),
                 "Some sentences show repeated transition patterns.".to_string(),
@@ -83,7 +134,7 @@ async fn analyze_document(
                 "{source_name} was checked for similarity risk and citation weakness."
             ),
             score: 18.0,
-            pex_cost: 8.0,
+            pex_cost,
             findings: vec![
                 "Common phrases may require rewriting.".to_string(),
                 "Citation review is recommended for factual claims.".to_string(),
@@ -98,7 +149,7 @@ async fn analyze_document(
                 text.chars().count()
             ),
             score: 91.0,
-            pex_cost: 10.0,
+            pex_cost,
             findings: vec![
                 "Reduced repetitive transitions.".to_string(),
                 "Improved sentence variety and natural flow.".to_string(),
@@ -107,11 +158,6 @@ async fn analyze_document(
             output: "Humanized sample: The text now reads with a clearer, more natural voice while preserving the original meaning and structure.".to_string(),
         },
     };
-
-    let _access_placeholder = json!({
-        "tokenAccessChecked": true,
-        "note": "Production will validate user Pera-X balance before processing.",
-    });
 
     Ok(Json(response))
 }
