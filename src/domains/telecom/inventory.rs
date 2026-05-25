@@ -26,6 +26,29 @@ pub struct NumberBuyRequest {
     pub phone_number: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NumberReserveRequest {
+    pub country: String,
+    pub phone_number: String,
+    pub plan: String,
+    pub credit_amount: f64,
+    pub credit_balance: f64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NumberReserveResponse {
+    pub order_id: String,
+    pub phone_number: String,
+    pub country: String,
+    pub plan: String,
+    pub status: String,
+    pub credit_cost: f64,
+    pub remaining_credits: f64,
+    pub message: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ProvisioningResponse {
     pub order_id: String,
@@ -65,6 +88,34 @@ pub async fn search_global_numbers(
     }
 
     Ok(Json(response.json().await?))
+}
+
+pub async fn reserve_number_with_credits(
+    Json(payload): Json<NumberReserveRequest>,
+) -> GatewayResult<Json<NumberReserveResponse>> {
+    let phone_number = normalize_phone_number(&payload.phone_number)?;
+    let credit_cost = payload.credit_amount.max(0.0);
+    let remaining_credits = payload.credit_balance - credit_cost;
+    let confirmed = credit_cost > 0.0 && remaining_credits >= 0.0;
+
+    Ok(Json(NumberReserveResponse {
+        order_id: format!("num_order_{}", chrono::Utc::now().timestamp_millis()),
+        phone_number,
+        country: payload.country,
+        plan: payload.plan,
+        status: if confirmed {
+            "reserved".to_string()
+        } else {
+            "rejected".to_string()
+        },
+        credit_cost: if confirmed { credit_cost } else { 0.0 },
+        remaining_credits,
+        message: if confirmed {
+            "Global number reservation accepted. Credits can be deducted and provisioning can continue.".to_string()
+        } else {
+            "Global number reservation rejected. Insufficient Credits or invalid cost.".to_string()
+        },
+    }))
 }
 
 pub async fn purchase_number(
