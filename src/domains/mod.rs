@@ -5,5 +5,6 @@ pub mod b2b_gateway;
 pub mod checkout;
 pub mod credits;
 pub mod payments;
+pub mod pricing;
 pub mod solana;
 pub mod telecom;
