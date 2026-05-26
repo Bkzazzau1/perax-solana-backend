@@ -1,7 +1,11 @@
-use axum::{Json, Router, routing::post};
+use axum::{Json, Router, extract::State, routing::post};
 use serde::{Deserialize, Serialize};
 
-use crate::{error::GatewayResult, state::AppState};
+use crate::{
+    domains::pricing,
+    error::GatewayResult,
+    state::AppState,
+};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,11 +44,11 @@ pub enum AiTool {
 }
 
 impl AiTool {
-    fn credit_cost(self) -> f64 {
+    fn service_code(self) -> &'static str {
         match self {
-            Self::AiDetector => 6.0,
-            Self::PlagiarismChecker => 8.0,
-            Self::Humanizer => 10.0,
+            Self::AiDetector => "ai_detector",
+            Self::PlagiarismChecker => "plagiarism_checker",
+            Self::Humanizer => "humanizer",
         }
     }
 }
@@ -74,9 +78,11 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn check_access(
+    State(state): State<AppState>,
     Json(payload): Json<AiAccessCheckRequest>,
 ) -> GatewayResult<Json<AiAccessCheckResponse>> {
-    let credit_cost = payload.tool.credit_cost();
+    let price = pricing::get_utility_price(&state, payload.tool.service_code()).await?;
+    let credit_cost = price.credit_cost;
     let remaining_credits = payload.credit_balance - credit_cost;
     let allowed = remaining_credits >= 0.0;
 
@@ -87,7 +93,7 @@ async fn check_access(
         credit_balance: payload.credit_balance,
         remaining_credits,
         message: if allowed {
-            "Credit access confirmed. AI task can continue.".to_string()
+            "Credit access confirmed from backend pricing. AI task can continue.".to_string()
         } else {
             "Insufficient Credits for this AI task.".to_string()
         },
@@ -95,6 +101,7 @@ async fn check_access(
 }
 
 async fn analyze_document(
+    State(state): State<AppState>,
     Json(payload): Json<AiAnalyzeRequest>,
 ) -> GatewayResult<Json<AiAnalyzeResponse>> {
     let source_name = payload
@@ -110,7 +117,8 @@ async fn analyze_document(
             AiInputMode::Text
         }
     });
-    let credit_cost = payload.tool.credit_cost();
+    let price = pricing::get_utility_price(&state, payload.tool.service_code()).await?;
+    let credit_cost = price.credit_cost;
 
     let response = match payload.tool {
         AiTool::AiDetector => AiAnalyzeResponse {
