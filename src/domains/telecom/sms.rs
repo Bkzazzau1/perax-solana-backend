@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    domains::auth::middleware::AuthenticatedAccount,
+    domains::{auth::middleware::AuthenticatedAccount, pricing},
     error::{GatewayError, GatewayResult},
     infra::cache,
     state::AppState,
@@ -88,7 +88,8 @@ pub async fn send_sms(
     }
 
     let parts_billed = ((body_len as f64) / 160.0).ceil() as usize;
-    let cost_per_segment = 0.02;
+    let sms_price = pricing::get_utility_price(&state, "sms_outbound").await?;
+    let cost_per_segment = sms_price.credit_cost;
     let total_sms_cost = (parts_billed as f64) * cost_per_segment;
 
     let user_redis_key = format!("client:balance:{}", account.account_id);
@@ -106,7 +107,7 @@ pub async fn send_sms(
         to = %request.to,
         parts = parts_billed,
         cost = total_sms_cost,
-        "Pre-flight SMS balance debited, dispatching message to downstream carrier"
+        "Pre-flight SMS balance debited using backend pricing, dispatching message to downstream carrier"
     );
 
     let telnyx_sms_url = format!("{}/v2/messages", state.config.telnyx_base_url);
