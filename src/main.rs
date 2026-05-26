@@ -27,6 +27,7 @@ async fn main() -> GatewayResult<()> {
         .route("/", get(root))
         .route("/healthz", get(healthz))
         .merge(domains::admin::router())
+        .merge(domains::admin_pricing::router())
         .merge(domains::payments::router())
         .merge(domains::pricing::router())
         .merge(domains::ai::routes::router())
@@ -43,9 +44,7 @@ async fn main() -> GatewayResult<()> {
         "perax utility gateway listening on {}",
         listener.local_addr()?
     );
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
@@ -56,30 +55,6 @@ async fn healthz() -> &'static str {
 
 async fn root() -> Redirect {
     Redirect::temporary("/admin")
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install terminate signal handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
 }
 
 fn init_tracing() {
