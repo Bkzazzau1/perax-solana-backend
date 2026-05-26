@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod admin_pricing;
 pub mod ai;
 pub mod auth;
 pub mod b2b_gateway;
