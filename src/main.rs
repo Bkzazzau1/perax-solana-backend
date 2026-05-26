@@ -22,6 +22,7 @@ async fn main() -> GatewayResult<()> {
 
     domains::solana::client::spawn_treasury_listener(state.clone());
     domains::solana::burner::spawn_daily_burner(state.clone());
+    domains::solana::market_monitor::spawn_market_unlock_monitor(state.clone());
 
     let app = Router::new()
         .route("/", get(root))
