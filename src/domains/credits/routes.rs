@@ -1,7 +1,9 @@
 use axum::{Json, Router, extract::State, routing::post};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::{
+    domains::solana::revenue_ledger::{RecordPexRevenueInput, record_pex_revenue_event},
     error::{GatewayError, GatewayResult},
     state::AppState,
 };
@@ -12,6 +14,9 @@ pub struct BuyCreditsRequest {
     pub method: CreditFundingMethod,
     pub credit_amount: f64,
     pub pex_balance: Option<f64>,
+    pub reference_hex: Option<String>,
+    pub payer_wallet: Option<String>,
+    pub token_mint: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy)]
@@ -45,6 +50,19 @@ struct CreditExchangeRateRecord {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PexRevenueLedgerSummary {
+    pub event_id: Uuid,
+    pub reference_hex: String,
+    pub pex_received: f64,
+    pub credits_granted: f64,
+    pub immediate_burn_percentage: f64,
+    pub pex_burn_amount: f64,
+    pub pex_remaining_amount: f64,
+    pub burn_status: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BuyCreditsResponse {
     pub accepted: bool,
     pub method: CreditFundingMethod,
@@ -56,6 +74,7 @@ pub struct BuyCreditsResponse {
     pub credits_per_unit: f64,
     pub status: String,
     pub message: String,
+    pub pex_revenue_ledger: Option<PexRevenueLedgerSummary>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -86,6 +105,60 @@ async fn buy_credits(
     let remaining_pex = payload.pex_balance.map(|balance| balance - pex_required);
     let accepted = credit_amount > 0.0 && remaining_pex.map(|value| value >= 0.0).unwrap_or(true);
 
+    let mut pex_revenue_ledger = None;
+    let mut status = if accepted {
+        "pending_settlement".to_string()
+    } else {
+        "rejected".to_string()
+    };
+    let mut message = if accepted {
+        format!(
+            "Credit purchase accepted using backend rate: {} Credits per {}.",
+            credits_per_unit, rate.unit_label
+        )
+    } else {
+        "Credit purchase rejected. Check amount or available PEX balance.".to_string()
+    };
+
+    if accepted && matches!(payload.method, CreditFundingMethod::Pex) {
+        let reference_hex = payload.reference_hex.clone().ok_or_else(|| {
+            GatewayError::Upstream(
+                "referenceHex is required when buying Credits with PEX".to_string(),
+            )
+        })?;
+
+        let record = record_pex_revenue_event(
+            &state,
+            RecordPexRevenueInput {
+                reference_hex,
+                payer_wallet: payload.payer_wallet.clone(),
+                token_mint: payload.token_mint.clone(),
+                pex_received: pex_required,
+                credits_granted: credit_amount,
+                service_code: Some("credits_buy".to_string()),
+                raw_event: None,
+            },
+        )
+        .await?;
+
+        status = "credited_and_burn_declared".to_string();
+        message = format!(
+            "Credits granted. PEX revenue recorded; {}% immediate burn declared and remaining PEX assigned to Trading Company second wallet.",
+            record.immediate_burn_percentage
+        );
+
+        pex_revenue_ledger = Some(PexRevenueLedgerSummary {
+            event_id: record.id,
+            reference_hex: record.reference_hex,
+            pex_received: record.pex_received,
+            credits_granted: record.credits_granted,
+            immediate_burn_percentage: record.immediate_burn_percentage,
+            pex_burn_amount: record.pex_burn_amount,
+            pex_remaining_amount: record.pex_remaining_amount,
+            burn_status: record.burn_status,
+        });
+    }
+
     Ok(Json(BuyCreditsResponse {
         accepted,
         method: payload.method,
@@ -95,19 +168,9 @@ async fn buy_credits(
         pex_required,
         remaining_pex,
         credits_per_unit,
-        status: if accepted {
-            "pending_settlement".to_string()
-        } else {
-            "rejected".to_string()
-        },
-        message: if accepted {
-            format!(
-                "Credit purchase accepted using backend rate: {} Credits per {}.",
-                credits_per_unit, rate.unit_label
-            )
-        } else {
-            "Credit purchase rejected. Check amount or available PEX balance.".to_string()
-        },
+        status,
+        message,
+        pex_revenue_ledger,
     }))
 }
 
