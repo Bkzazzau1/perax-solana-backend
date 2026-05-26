@@ -25,6 +25,14 @@ pub fn router() -> Router<AppState> {
         .route("/telecom/numbers/pricing", get(inventory::list_number_pricing))
         .route("/telecom/numbers/mine", get(inventory::list_my_numbers))
         .route(
+            "/telecom/numbers/{id}/cancel",
+            post(inventory::cancel_number_subscription),
+        )
+        .route(
+            "/telecom/numbers/{id}/reactivate",
+            post(inventory::reactivate_number_subscription),
+        )
+        .route(
             "/telecom/numbers/renewals/process",
             post(inventory::process_due_number_renewals),
         )
