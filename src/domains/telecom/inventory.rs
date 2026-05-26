@@ -116,6 +116,36 @@ pub struct MyNumbersResponse {
     pub numbers: Vec<MyNumberDto>,
 }
 
+#[derive(Debug, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+struct NumberRenewalCandidate {
+    id: Uuid,
+    account_id: Option<Uuid>,
+    phone_number: String,
+    monthly_fee_credits: Option<f64>,
+    next_renewal_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NumberRenewalItem {
+    pub id: Uuid,
+    pub phone_number: String,
+    pub status: String,
+    pub monthly_fee_credits: f64,
+    pub next_renewal_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NumberRenewalResponse {
+    pub processed: usize,
+    pub renewed: usize,
+    pub past_due: usize,
+    pub items: Vec<NumberRenewalItem>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ProvisioningResponse {
     pub order_id: String,
@@ -183,6 +213,7 @@ pub async fn list_number_pricing(
 
 pub async fn reserve_number_with_credits(
     State(state): State<AppState>,
+    account: AuthenticatedAccount,
     Json(payload): Json<NumberReserveRequest>,
 ) -> GatewayResult<Json<NumberReserveResponse>> {
     let phone_number = normalize_phone_number(&payload.phone_number)?;
@@ -210,6 +241,7 @@ pub async fn reserve_number_with_credits(
     if confirmed {
         save_reserved_number(
             &state,
+            account.account_id,
             &phone_number,
             &order_id,
             &payload.country,
@@ -245,7 +277,10 @@ pub async fn reserve_number_with_credits(
     }))
 }
 
-pub async fn list_my_numbers(State(state): State<AppState>) -> GatewayResult<Json<MyNumbersResponse>> {
+pub async fn list_my_numbers(
+    State(state): State<AppState>,
+    account: AuthenticatedAccount,
+) -> GatewayResult<Json<MyNumbersResponse>> {
     let records = sqlx::query_as::<_, MyNumberRecord>(
         r#"
         select id,
@@ -259,15 +294,128 @@ pub async fn list_my_numbers(State(state): State<AppState>) -> GatewayResult<Jso
                billing_status,
                created_at
         from provisioned_numbers
+        where account_id = $1
         order by created_at desc
+        limit 100
+        "#,
+    )
+    .bind(account.account_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(Json(MyNumbersResponse {
+        numbers: records.into_iter().map(MyNumberDto::from).collect(),
+    }))
+}
+
+pub async fn process_due_number_renewals(
+    State(state): State<AppState>,
+) -> GatewayResult<Json<NumberRenewalResponse>> {
+    let candidates = sqlx::query_as::<_, NumberRenewalCandidate>(
+        r#"
+        select id,
+               account_id,
+               phone_number,
+               monthly_fee_credits::double precision as monthly_fee_credits,
+               next_renewal_at
+        from provisioned_numbers
+        where billing_status = 'active'
+          and next_renewal_at is not null
+          and next_renewal_at <= now()
+        order by next_renewal_at asc
         limit 100
         "#,
     )
     .fetch_all(&state.db)
     .await?;
 
-    Ok(Json(MyNumbersResponse {
-        numbers: records.into_iter().map(MyNumberDto::from).collect(),
+    let mut items = Vec::with_capacity(candidates.len());
+    let mut renewed = 0usize;
+    let mut past_due = 0usize;
+
+    for candidate in candidates {
+        let monthly_fee = candidate.monthly_fee_credits.unwrap_or(0.0);
+
+        if monthly_fee <= 0.0 {
+            mark_number_past_due(&state, candidate.id).await?;
+            past_due += 1;
+            items.push(NumberRenewalItem {
+                id: candidate.id,
+                phone_number: candidate.phone_number,
+                status: "past_due".to_string(),
+                monthly_fee_credits: monthly_fee,
+                next_renewal_at: candidate.next_renewal_at,
+                message: "No monthly fee is configured for this number.".to_string(),
+            });
+            continue;
+        }
+
+        let Some(account_id) = candidate.account_id else {
+            mark_number_past_due(&state, candidate.id).await?;
+            past_due += 1;
+            items.push(NumberRenewalItem {
+                id: candidate.id,
+                phone_number: candidate.phone_number,
+                status: "past_due".to_string(),
+                monthly_fee_credits: monthly_fee,
+                next_renewal_at: candidate.next_renewal_at,
+                message: "Number has no linked account for renewal billing.".to_string(),
+            });
+            continue;
+        };
+
+        let cache_key = format!("client:balance:{}", account_id);
+        let current_credits = cache::get_credits(&state.cache, &cache_key).await?;
+
+        match current_credits {
+            Some(balance) if balance >= monthly_fee => {
+                cache::increment_credits(&state.cache, &cache_key, -monthly_fee).await?;
+                let new_renewal_at = chrono::Utc::now() + chrono::Duration::days(30);
+                sqlx::query(
+                    r#"
+                    update provisioned_numbers
+                    set next_renewal_at = $1,
+                        billing_status = 'active',
+                        status = 'reserved',
+                        updated_at = now()
+                    where id = $2
+                    "#,
+                )
+                .bind(new_renewal_at)
+                .bind(candidate.id)
+                .execute(&state.db)
+                .await?;
+
+                renewed += 1;
+                items.push(NumberRenewalItem {
+                    id: candidate.id,
+                    phone_number: candidate.phone_number,
+                    status: "renewed".to_string(),
+                    monthly_fee_credits: monthly_fee,
+                    next_renewal_at: Some(new_renewal_at),
+                    message: "Monthly subscription renewed successfully.".to_string(),
+                });
+            }
+            _ => {
+                mark_number_past_due(&state, candidate.id).await?;
+                past_due += 1;
+                items.push(NumberRenewalItem {
+                    id: candidate.id,
+                    phone_number: candidate.phone_number,
+                    status: "past_due".to_string(),
+                    monthly_fee_credits: monthly_fee,
+                    next_renewal_at: candidate.next_renewal_at,
+                    message: "Insufficient Credits for monthly renewal.".to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(Json(NumberRenewalResponse {
+        processed: items.len(),
+        renewed,
+        past_due,
+        items,
     }))
 }
 
@@ -366,6 +514,7 @@ async fn get_number_pricing(
 
 async fn save_reserved_number(
     state: &AppState,
+    account_id: Uuid,
     phone_number: &str,
     order_id: &str,
     country: &str,
@@ -379,6 +528,7 @@ async fn save_reserved_number(
         r#"
         insert into provisioned_numbers (
             id,
+            account_id,
             phone_number,
             telnyx_order_id,
             country,
@@ -389,9 +539,10 @@ async fn save_reserved_number(
             next_renewal_at,
             billing_status
         )
-        values (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, 'active')
+        values (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, 'active')
         on conflict (phone_number) do update
-        set telnyx_order_id = excluded.telnyx_order_id,
+        set account_id = excluded.account_id,
+            telnyx_order_id = excluded.telnyx_order_id,
             country = excluded.country,
             plan = excluded.plan,
             status = excluded.status,
@@ -402,6 +553,7 @@ async fn save_reserved_number(
             updated_at = now()
         "#,
     )
+    .bind(account_id)
     .bind(phone_number)
     .bind(order_id)
     .bind(country)
@@ -438,6 +590,23 @@ async fn save_provisioned_number(
     .bind(phone_number)
     .bind(order_id)
     .bind(status)
+    .execute(&state.db)
+    .await?;
+
+    Ok(())
+}
+
+async fn mark_number_past_due(state: &AppState, number_id: Uuid) -> GatewayResult<()> {
+    sqlx::query(
+        r#"
+        update provisioned_numbers
+        set billing_status = 'past_due',
+            status = 'past_due',
+            updated_at = now()
+        where id = $1
+        "#,
+    )
+    .bind(number_id)
     .execute(&state.db)
     .await?;
 
