@@ -42,6 +42,9 @@ pub struct Config {
     pub perax_anchor_workspace: String,
     pub perax_program_id: String,
     pub trading_co_treasury: String,
+    pub trading_company_second_wallet: String,
+    pub pex_immediate_burn_percentage: f64,
+    pub pex_monthly_sell_cap_percentage: f64,
     pub burn_execution_mode: BurnExecutionMode,
     pub jwt_secret: String,
     pub claude_base_url: String,
@@ -67,6 +70,9 @@ impl Config {
             ),
             perax_program_id: env_or("PERAX_PROGRAM_ID", "11111111111111111111111111111111"),
             trading_co_treasury: required("TRADING_CO_TREASURY")?,
+            trading_company_second_wallet: required("TRADING_COMPANY_SECOND_WALLET")?,
+            pex_immediate_burn_percentage: parse_percentage_env("PEX_IMMEDIATE_BURN_PERCENTAGE", 10.0)?,
+            pex_monthly_sell_cap_percentage: parse_percentage_env("PEX_MONTHLY_SELL_CAP_PERCENTAGE", 50.0)?,
             burn_execution_mode,
             jwt_secret: required("JWT_SECRET")?,
             claude_base_url: env_or("CLAUDE_BASE_URL", "https://api.anthropic.com"),
@@ -91,6 +97,25 @@ impl Config {
             ));
         }
 
+        validate_wallet_like("TRADING_CO_TREASURY", &self.trading_co_treasury)?;
+        validate_wallet_like(
+            "TRADING_COMPANY_SECOND_WALLET",
+            &self.trading_company_second_wallet,
+        )?;
+
+        if !(0.0..=100.0).contains(&self.pex_immediate_burn_percentage) {
+            return Err(GatewayError::Config(
+                "PEX_IMMEDIATE_BURN_PERCENTAGE must be between 0 and 100".to_string(),
+            ));
+        }
+
+        if self.pex_monthly_sell_cap_percentage != 50.0 {
+            return Err(GatewayError::Config(
+                "PEX_MONTHLY_SELL_CAP_PERCENTAGE must remain 50 under approved PEX policy"
+                    .to_string(),
+            ));
+        }
+
         self.bind_addr();
         Ok(())
     }
@@ -109,4 +134,22 @@ fn parse_port() -> GatewayResult<u16> {
         .unwrap_or_else(|_| "8080".to_string())
         .parse()
         .map_err(|_| GatewayError::Config("PORT must be a valid u16".to_string()))
+}
+
+fn parse_percentage_env(key: &'static str, fallback: f64) -> GatewayResult<f64> {
+    env::var(key)
+        .unwrap_or_else(|_| fallback.to_string())
+        .parse::<f64>()
+        .map_err(|_| GatewayError::Config(format!("{key} must be a valid percentage number")))
+}
+
+fn validate_wallet_like(key: &'static str, value: &str) -> GatewayResult<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.starts_with("replace-with-") || trimmed.len() < 32 {
+        return Err(GatewayError::Config(format!(
+            "{key} must be configured with a real Solana SPL token account or wallet address"
+        )));
+    }
+
+    Ok(())
 }
