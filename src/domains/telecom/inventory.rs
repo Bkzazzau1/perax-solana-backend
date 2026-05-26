@@ -57,9 +57,9 @@ pub struct NumberReserveResponse {
 pub struct NumberPricingRecord {
     pub country: String,
     pub number_type: String,
-    pub setup_fee_credits: sqlx::types::BigDecimal,
-    pub monthly_fee_credits: sqlx::types::BigDecimal,
-    pub annual_fee_credits: sqlx::types::BigDecimal,
+    pub setup_fee_credits: f64,
+    pub monthly_fee_credits: f64,
+    pub annual_fee_credits: f64,
     pub currency: String,
 }
 
@@ -88,8 +88,8 @@ pub struct MyNumberRecord {
     pub country: Option<String>,
     pub plan: Option<String>,
     pub status: String,
-    pub setup_fee_credits: Option<sqlx::types::BigDecimal>,
-    pub monthly_fee_credits: Option<sqlx::types::BigDecimal>,
+    pub setup_fee_credits: Option<f64>,
+    pub monthly_fee_credits: Option<f64>,
     pub next_renewal_at: Option<chrono::DateTime<chrono::Utc>>,
     pub billing_status: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -162,7 +162,12 @@ pub async fn list_number_pricing(
 ) -> GatewayResult<Json<NumberPricingResponse>> {
     let records = sqlx::query_as::<_, NumberPricingRecord>(
         r#"
-        select country, number_type, setup_fee_credits, monthly_fee_credits, annual_fee_credits, currency
+        select country,
+               number_type,
+               setup_fee_credits::double precision as setup_fee_credits,
+               monthly_fee_credits::double precision as monthly_fee_credits,
+               annual_fee_credits::double precision as annual_fee_credits,
+               currency
         from number_pricing_settings
         where is_active = true
         order by country asc, number_type asc
@@ -186,9 +191,9 @@ pub async fn reserve_number_with_credits(
         .clone()
         .unwrap_or_else(|| "local".to_string());
     let pricing = get_number_pricing(&state, &payload.country, &number_type).await?;
-    let setup_fee = big_decimal_to_f64(&pricing.setup_fee_credits);
-    let monthly_fee = big_decimal_to_f64(&pricing.monthly_fee_credits);
-    let annual_fee = big_decimal_to_f64(&pricing.annual_fee_credits);
+    let setup_fee = pricing.setup_fee_credits;
+    let monthly_fee = pricing.monthly_fee_credits;
+    let annual_fee = pricing.annual_fee_credits;
     let plan = payload.plan.trim().to_string();
     let recurring_months = if plan.eq_ignore_ascii_case("annual") { 12 } else { 1 };
     let subscription_cost = if plan.eq_ignore_ascii_case("annual") {
@@ -243,8 +248,16 @@ pub async fn reserve_number_with_credits(
 pub async fn list_my_numbers(State(state): State<AppState>) -> GatewayResult<Json<MyNumbersResponse>> {
     let records = sqlx::query_as::<_, MyNumberRecord>(
         r#"
-        select id, phone_number, country, plan, status, setup_fee_credits, monthly_fee_credits,
-               next_renewal_at, billing_status, created_at
+        select id,
+               phone_number,
+               country,
+               plan,
+               status,
+               setup_fee_credits::double precision as setup_fee_credits,
+               monthly_fee_credits::double precision as monthly_fee_credits,
+               next_renewal_at,
+               billing_status,
+               created_at
         from provisioned_numbers
         order by created_at desc
         limit 100
@@ -329,7 +342,12 @@ async fn get_number_pricing(
 ) -> GatewayResult<NumberPricingRecord> {
     sqlx::query_as::<_, NumberPricingRecord>(
         r#"
-        select country, number_type, setup_fee_credits, monthly_fee_credits, annual_fee_credits, currency
+        select country,
+               number_type,
+               setup_fee_credits::double precision as setup_fee_credits,
+               monthly_fee_credits::double precision as monthly_fee_credits,
+               annual_fee_credits::double precision as annual_fee_credits,
+               currency
         from number_pricing_settings
         where country = $1 and number_type = $2 and is_active = true
         limit 1
@@ -426,18 +444,14 @@ async fn save_provisioned_number(
     Ok(())
 }
 
-fn big_decimal_to_f64(value: &sqlx::types::BigDecimal) -> f64 {
-    value.to_string().parse::<f64>().unwrap_or(0.0)
-}
-
 impl From<NumberPricingRecord> for NumberPricingDto {
     fn from(value: NumberPricingRecord) -> Self {
         Self {
             country: value.country,
             number_type: value.number_type,
-            setup_fee_credits: big_decimal_to_f64(&value.setup_fee_credits),
-            monthly_fee_credits: big_decimal_to_f64(&value.monthly_fee_credits),
-            annual_fee_credits: big_decimal_to_f64(&value.annual_fee_credits),
+            setup_fee_credits: value.setup_fee_credits,
+            monthly_fee_credits: value.monthly_fee_credits,
+            annual_fee_credits: value.annual_fee_credits,
             currency: value.currency,
         }
     }
@@ -451,8 +465,8 @@ impl From<MyNumberRecord> for MyNumberDto {
             country: value.country,
             plan: value.plan,
             status: value.status,
-            setup_fee_credits: value.setup_fee_credits.as_ref().map(big_decimal_to_f64),
-            monthly_fee_credits: value.monthly_fee_credits.as_ref().map(big_decimal_to_f64),
+            setup_fee_credits: value.setup_fee_credits,
+            monthly_fee_credits: value.monthly_fee_credits,
             next_renewal_at: value.next_renewal_at,
             billing_status: value.billing_status,
             created_at: value.created_at,
