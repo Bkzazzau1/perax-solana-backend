@@ -47,7 +47,8 @@ async fn confirm_checkout(
         credit_cost,
         remaining_credits,
         message: if confirmed {
-            "Checkout confirmed. Credits can be deducted and service activation can continue.".to_string()
+            "Checkout confirmed. Credits can be deducted and service activation can continue."
+                .to_string()
         } else {
             "Checkout rejected. Insufficient Credits or invalid service cost.".to_string()
         },
