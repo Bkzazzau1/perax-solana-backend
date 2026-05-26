@@ -63,7 +63,7 @@ impl Config {
             solana_ws_url: env_or("SOLANA_WS_URL", "wss://api.mainnet-beta.solana.com"),
             perax_anchor_workspace: env_or(
                 "PERAX_ANCHOR_WORKSPACE",
-                "C:\\PROJECTS\\smartcontract PEX\\perax-ecosystem\\perax-contracts",
+                "C:\\PROJECTS\\Pera-X-ecosystem\\perax-contracts",
             ),
             perax_program_id: env_or("PERAX_PROGRAM_ID", "11111111111111111111111111111111"),
             trading_co_treasury: required("TRADING_CO_TREASURY")?,
