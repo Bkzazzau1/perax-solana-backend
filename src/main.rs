@@ -29,6 +29,7 @@ async fn main() -> GatewayResult<()> {
         .route("/healthz", get(healthz))
         .merge(domains::admin::router())
         .merge(domains::admin_auth::router())
+        .merge(domains::admin_pex::router())
         .merge(domains::admin_pricing::router())
         .merge(domains::payments::router())
         .merge(domains::pricing::router())
