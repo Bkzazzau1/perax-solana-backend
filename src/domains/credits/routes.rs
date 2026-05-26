@@ -1,7 +1,7 @@
-use axum::{Json, Router, routing::post};
+use axum::{Json, Router, extract::State, routing::post};
 use serde::{Deserialize, Serialize};
 
-use crate::{error::GatewayResult, state::AppState};
+use crate::{error::{GatewayError, GatewayResult}, state::AppState};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,14 +20,37 @@ pub enum CreditFundingMethod {
     VirtualAccount,
 }
 
+impl CreditFundingMethod {
+    fn asset_code(self) -> &'static str {
+        match self {
+            Self::Pex => "PEX",
+            Self::Card => "FIAT_USD",
+            Self::Stablecoin => "USDT",
+            Self::VirtualAccount => "FIAT_USD",
+        }
+    }
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+struct CreditExchangeRateRecord {
+    asset_code: String,
+    asset_name: String,
+    credits_per_unit: f64,
+    unit_label: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BuyCreditsResponse {
     pub accepted: bool,
     pub method: CreditFundingMethod,
     pub credit_amount: f64,
+    pub asset_code: String,
+    pub asset_required: f64,
     pub pex_required: f64,
     pub remaining_pex: Option<f64>,
+    pub credits_per_unit: f64,
     pub status: String,
     pub message: String,
 }
@@ -37,16 +60,26 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn buy_credits(
+    State(state): State<AppState>,
     Json(payload): Json<BuyCreditsRequest>,
 ) -> GatewayResult<Json<BuyCreditsResponse>> {
     let credit_amount = payload.credit_amount.max(0.0);
-    let pex_required = match payload.method {
-        CreditFundingMethod::Pex => credit_amount,
-        CreditFundingMethod::Card
-        | CreditFundingMethod::Stablecoin
-        | CreditFundingMethod::VirtualAccount => 0.0,
-    };
+    let asset_code = payload.method.asset_code();
+    let rate = get_credit_exchange_rate(&state, asset_code).await?;
+    let credits_per_unit = rate.credits_per_unit;
 
+    if credits_per_unit <= 0.0 {
+        return Err(GatewayError::Upstream(format!(
+            "Invalid Credit exchange rate configured for {asset_code}"
+        )));
+    }
+
+    let asset_required = credit_amount / credits_per_unit;
+    let pex_required = if matches!(payload.method, CreditFundingMethod::Pex) {
+        asset_required
+    } else {
+        0.0
+    };
     let remaining_pex = payload.pex_balance.map(|balance| balance - pex_required);
     let accepted = credit_amount > 0.0 && remaining_pex.map(|value| value >= 0.0).unwrap_or(true);
 
@@ -54,17 +87,46 @@ async fn buy_credits(
         accepted,
         method: payload.method,
         credit_amount,
+        asset_code: asset_code.to_string(),
+        asset_required,
         pex_required,
         remaining_pex,
+        credits_per_unit,
         status: if accepted {
             "pending_settlement".to_string()
         } else {
             "rejected".to_string()
         },
         message: if accepted {
-            "Credit purchase request accepted. Settlement and crediting will be finalized by backend policy.".to_string()
+            format!(
+                "Credit purchase accepted using backend rate: {} Credits per {}.",
+                credits_per_unit, rate.unit_label
+            )
         } else {
             "Credit purchase rejected. Check amount or available PEX balance.".to_string()
         },
     }))
+}
+
+async fn get_credit_exchange_rate(
+    state: &AppState,
+    asset_code: &str,
+) -> GatewayResult<CreditExchangeRateRecord> {
+    sqlx::query_as::<_, CreditExchangeRateRecord>(
+        r#"
+        select asset_code,
+               asset_name,
+               credits_per_unit::double precision as credits_per_unit,
+               unit_label
+        from credit_exchange_rates
+        where asset_code = $1 and is_active = true
+        limit 1
+        "#,
+    )
+    .bind(asset_code)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| GatewayError::Upstream(format!(
+        "No active Credit exchange rate configured for {asset_code}"
+    )))
 }
