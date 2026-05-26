@@ -49,6 +49,23 @@ pub struct NumberReserveResponse {
     pub message: String,
 }
 
+#[derive(Debug, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct MyNumberRecord {
+    pub id: Uuid,
+    pub phone_number: String,
+    pub country: Option<String>,
+    pub plan: Option<String>,
+    pub status: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MyNumbersResponse {
+    pub numbers: Vec<MyNumberRecord>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ProvisioningResponse {
     pub order_id: String,
@@ -91,15 +108,29 @@ pub async fn search_global_numbers(
 }
 
 pub async fn reserve_number_with_credits(
+    State(state): State<AppState>,
     Json(payload): Json<NumberReserveRequest>,
 ) -> GatewayResult<Json<NumberReserveResponse>> {
     let phone_number = normalize_phone_number(&payload.phone_number)?;
     let credit_cost = payload.credit_amount.max(0.0);
     let remaining_credits = payload.credit_balance - credit_cost;
     let confirmed = credit_cost > 0.0 && remaining_credits >= 0.0;
+    let order_id = format!("num_order_{}", chrono::Utc::now().timestamp_millis());
+
+    if confirmed {
+        save_reserved_number(
+            &state,
+            &phone_number,
+            &order_id,
+            &payload.country,
+            &payload.plan,
+            "reserved",
+        )
+        .await?;
+    }
 
     Ok(Json(NumberReserveResponse {
-        order_id: format!("num_order_{}", chrono::Utc::now().timestamp_millis()),
+        order_id,
         phone_number,
         country: payload.country,
         plan: payload.plan,
@@ -116,6 +147,21 @@ pub async fn reserve_number_with_credits(
             "Global number reservation rejected. Insufficient Credits or invalid cost.".to_string()
         },
     }))
+}
+
+pub async fn list_my_numbers(State(state): State<AppState>) -> GatewayResult<Json<MyNumbersResponse>> {
+    let numbers = sqlx::query_as::<_, MyNumberRecord>(
+        r#"
+        select id, phone_number, country, plan, status, created_at
+        from provisioned_numbers
+        order by created_at desc
+        limit 100
+        "#,
+    )
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(Json(MyNumbersResponse { numbers }))
 }
 
 pub async fn purchase_number(
@@ -182,6 +228,44 @@ pub async fn purchase_number(
     }))
 }
 
+async fn save_reserved_number(
+    state: &AppState,
+    phone_number: &str,
+    order_id: &str,
+    country: &str,
+    plan: &str,
+    status: &str,
+) -> GatewayResult<()> {
+    sqlx::query(
+        r#"
+        insert into provisioned_numbers (
+            id,
+            phone_number,
+            telnyx_order_id,
+            country,
+            plan,
+            status
+        )
+        values (gen_random_uuid(), $1, $2, $3, $4, $5)
+        on conflict (phone_number) do update
+        set telnyx_order_id = excluded.telnyx_order_id,
+            country = excluded.country,
+            plan = excluded.plan,
+            status = excluded.status,
+            updated_at = now()
+        "#,
+    )
+    .bind(phone_number)
+    .bind(order_id)
+    .bind(country)
+    .bind(plan)
+    .bind(status)
+    .execute(&state.db)
+    .await?;
+
+    Ok(())
+}
+
 async fn save_provisioned_number(
     state: &AppState,
     account_id: Uuid,
@@ -194,8 +278,10 @@ async fn save_provisioned_number(
         insert into provisioned_numbers (id, account_id, phone_number, telnyx_order_id, status)
         values (gen_random_uuid(), $1, $2, $3, $4)
         on conflict (phone_number) do update
-        set telnyx_order_id = excluded.telnyx_order_id,
-            status = excluded.status
+        set account_id = excluded.account_id,
+            telnyx_order_id = excluded.telnyx_order_id,
+            status = excluded.status,
+            updated_at = now()
         "#,
     )
     .bind(account_id)
