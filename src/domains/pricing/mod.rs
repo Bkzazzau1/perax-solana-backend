@@ -5,7 +5,10 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::{error::{GatewayError, GatewayResult}, state::AppState};
+use crate::{
+    error::{GatewayError, GatewayResult},
+    state::AppState,
+};
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
@@ -41,7 +44,10 @@ pub struct CreditExchangeRatesResponse {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/pricing/utilities", get(list_utility_pricing))
-        .route("/pricing/utilities/{service_code}", get(get_utility_pricing))
+        .route(
+            "/pricing/utilities/{service_code}",
+            get(get_utility_pricing),
+        )
         .route("/pricing/credit-rates", get(list_credit_exchange_rates))
 }
 
@@ -113,7 +119,9 @@ pub async fn get_utility_price(
     .bind(service_code)
     .fetch_optional(&state.db)
     .await?
-    .ok_or_else(|| GatewayError::Upstream(format!(
-        "No active pricing configured for service: {service_code}"
-    )))
+    .ok_or_else(|| {
+        GatewayError::Upstream(format!(
+            "No active pricing configured for service: {service_code}"
+        ))
+    })
 }

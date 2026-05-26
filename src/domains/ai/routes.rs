@@ -1,11 +1,7 @@
 use axum::{Json, Router, extract::State, routing::post};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    domains::pricing,
-    error::GatewayResult,
-    state::AppState,
-};
+use crate::{domains::pricing, error::GatewayResult, state::AppState};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

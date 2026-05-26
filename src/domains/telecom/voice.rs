@@ -91,6 +91,7 @@ pub async fn start_call_session(
     State(state): State<AppState>,
     Json(payload): Json<StartCallRequest>,
 ) -> GatewayResult<Json<StartCallResponse>> {
+    let _client_rate_per_minute = payload.rate_per_minute;
     let service_code = if payload.is_international {
         "global_call"
     } else {
@@ -136,6 +137,7 @@ pub async fn end_call_session(
     State(state): State<AppState>,
     Json(payload): Json<EndCallRequest>,
 ) -> GatewayResult<Json<EndCallResponse>> {
+    let _client_rate_per_minute = payload.rate_per_minute;
     let duration_seconds = payload.duration_seconds.max(0);
     let is_international = payload.is_international.unwrap_or(true);
     let service_code = if is_international {

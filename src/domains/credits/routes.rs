@@ -1,7 +1,10 @@
 use axum::{Json, Router, extract::State, routing::post};
 use serde::{Deserialize, Serialize};
 
-use crate::{error::{GatewayError, GatewayResult}, state::AppState};
+use crate::{
+    error::{GatewayError, GatewayResult},
+    state::AppState,
+};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -126,7 +129,9 @@ async fn get_credit_exchange_rate(
     .bind(asset_code)
     .fetch_optional(&state.db)
     .await?
-    .ok_or_else(|| GatewayError::Upstream(format!(
-        "No active Credit exchange rate configured for {asset_code}"
-    )))
+    .ok_or_else(|| {
+        GatewayError::Upstream(format!(
+            "No active Credit exchange rate configured for {asset_code}"
+        ))
+    })
 }

@@ -250,7 +250,11 @@ pub async fn reserve_number_with_credits(
     let monthly_fee = pricing.monthly_fee_credits;
     let annual_fee = pricing.annual_fee_credits;
     let plan = payload.plan.trim().to_string();
-    let recurring_months = if plan.eq_ignore_ascii_case("annual") { 12 } else { 1 };
+    let recurring_months = if plan.eq_ignore_ascii_case("annual") {
+        12
+    } else {
+        1
+    };
     let subscription_cost = if plan.eq_ignore_ascii_case("annual") {
         annual_fee
     } else {
@@ -296,7 +300,8 @@ pub async fn reserve_number_with_credits(
         message: if confirmed {
             "Global number reservation accepted. The number is a recurring subscription and will renew monthly unless cancelled.".to_string()
         } else {
-            "Global number reservation rejected. Insufficient Credits for setup and subscription.".to_string()
+            "Global number reservation rejected. Insufficient Credits for setup and subscription."
+                .to_string()
         },
     }))
 }

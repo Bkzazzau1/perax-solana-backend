@@ -6,7 +6,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{error::{GatewayError, GatewayResult}, state::AppState};
+use crate::{
+    domains::admin_auth::AuthenticatedAdmin,
+    error::{GatewayError, GatewayResult},
+    state::AppState,
+};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -111,6 +115,9 @@ pub struct NumberPricesAdminResponse {
 }
 
 async fn list_utility_prices(
+    AuthenticatedAdmin {
+        username: _admin_username,
+    }: AuthenticatedAdmin,
     State(state): State<AppState>,
 ) -> GatewayResult<Json<UtilityPricesAdminResponse>> {
     let pricing = sqlx::query_as::<_, UtilityPriceAdminRecord>(
@@ -132,6 +139,9 @@ async fn list_utility_prices(
 }
 
 async fn update_utility_price(
+    AuthenticatedAdmin {
+        username: _admin_username,
+    }: AuthenticatedAdmin,
     State(state): State<AppState>,
     Path(service_code): Path<String>,
     Json(payload): Json<UpdateUtilityPriceRequest>,
@@ -172,6 +182,9 @@ async fn update_utility_price(
 }
 
 async fn list_credit_rates(
+    AuthenticatedAdmin {
+        username: _admin_username,
+    }: AuthenticatedAdmin,
     State(state): State<AppState>,
 ) -> GatewayResult<Json<CreditRatesAdminResponse>> {
     let rates = sqlx::query_as::<_, CreditRateAdminRecord>(
@@ -192,6 +205,9 @@ async fn list_credit_rates(
 }
 
 async fn update_credit_rate(
+    AuthenticatedAdmin {
+        username: _admin_username,
+    }: AuthenticatedAdmin,
     State(state): State<AppState>,
     Path(asset_code): Path<String>,
     Json(payload): Json<UpdateCreditRateRequest>,
@@ -229,6 +245,9 @@ async fn update_credit_rate(
 }
 
 async fn list_number_prices(
+    AuthenticatedAdmin {
+        username: _admin_username,
+    }: AuthenticatedAdmin,
     State(state): State<AppState>,
 ) -> GatewayResult<Json<NumberPricesAdminResponse>> {
     let pricing = sqlx::query_as::<_, NumberPriceAdminRecord>(
@@ -252,6 +271,9 @@ async fn list_number_prices(
 }
 
 async fn update_number_price(
+    AuthenticatedAdmin {
+        username: _admin_username,
+    }: AuthenticatedAdmin,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateNumberPriceRequest>,
