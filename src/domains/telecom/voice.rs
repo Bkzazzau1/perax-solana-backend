@@ -9,7 +9,7 @@ use tracing::{debug, error, info};
 use uuid::Uuid;
 
 use crate::{
-    domains::auth::middleware::AuthenticatedAccount,
+    domains::{auth::middleware::AuthenticatedAccount, pricing},
     error::{GatewayError, GatewayResult},
     infra::cache,
     state::AppState,
@@ -18,7 +18,7 @@ use crate::{
 #[derive(Debug, Deserialize)]
 pub struct WebRtcOffer {
     pub sdp: String,
-    pub destination_number: String, // Target phone number (e.g., +234... or +1...) [cite: 39]
+    pub destination_number: String,
     pub call_id: Option<String>,
 }
 
@@ -35,7 +35,7 @@ pub struct StartCallRequest {
     pub phone_number: String,
     pub destination: String,
     pub is_international: bool,
-    pub rate_per_minute: f64,
+    pub rate_per_minute: Option<f64>,
     pub credit_balance: f64,
 }
 
@@ -59,8 +59,9 @@ pub struct EndCallRequest {
     pub call_id: String,
     pub phone_number: String,
     pub duration_seconds: i64,
-    pub rate_per_minute: f64,
+    pub rate_per_minute: Option<f64>,
     pub credit_balance: f64,
+    pub is_international: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -76,7 +77,7 @@ pub struct EndCallResponse {
 
 pub async fn get_call(
     State(_state): State<AppState>,
-    _account: AuthenticatedAccount, // Guards metadata read queries
+    _account: AuthenticatedAccount,
     Path(id): Path<String>,
 ) -> GatewayResult<Json<WebRtcAnswer>> {
     Ok(Json(WebRtcAnswer {
@@ -87,9 +88,16 @@ pub async fn get_call(
 }
 
 pub async fn start_call_session(
+    State(state): State<AppState>,
     Json(payload): Json<StartCallRequest>,
 ) -> GatewayResult<Json<StartCallResponse>> {
-    let rate_per_minute = payload.rate_per_minute.max(0.0);
+    let service_code = if payload.is_international {
+        "global_call"
+    } else {
+        "local_call"
+    };
+    let price = pricing::get_utility_price(&state, service_code).await?;
+    let rate_per_minute = price.credit_cost.max(0.0);
     let estimated_minutes = if rate_per_minute > 0.0 {
         (payload.credit_balance / rate_per_minute).floor() as i64
     } else {
@@ -114,21 +122,29 @@ pub async fn start_call_session(
         reserved_credits: if can_start { rate_per_minute } else { 0.0 },
         message: if can_start {
             if payload.is_international {
-                "Global call session accepted. Credits will be charged by duration.".to_string()
+                "Global call session accepted using backend pricing. Credits will be charged by duration.".to_string()
             } else {
-                "Local call session accepted. Credits will be charged by duration.".to_string()
+                "Local call session accepted using backend pricing. Credits will be charged by duration.".to_string()
             }
         } else {
-            "Call rejected. Check phone number, rate, or available Credits.".to_string()
+            "Call rejected. Check phone number or available Credits.".to_string()
         },
     }))
 }
 
 pub async fn end_call_session(
+    State(state): State<AppState>,
     Json(payload): Json<EndCallRequest>,
 ) -> GatewayResult<Json<EndCallResponse>> {
     let duration_seconds = payload.duration_seconds.max(0);
-    let rate_per_minute = payload.rate_per_minute.max(0.0);
+    let is_international = payload.is_international.unwrap_or(true);
+    let service_code = if is_international {
+        "global_call"
+    } else {
+        "local_call"
+    };
+    let price = pricing::get_utility_price(&state, service_code).await?;
+    let rate_per_minute = price.credit_cost.max(0.0);
     let billed_minutes = (duration_seconds as f64 / 60.0).ceil().max(1.0);
     let credit_cost = billed_minutes * rate_per_minute;
     let remaining_credits = payload.credit_balance - credit_cost;
@@ -146,7 +162,7 @@ pub async fn end_call_session(
         remaining_credits,
         message: if confirmed {
             format!(
-                "Call to {} completed. Credits deducted by billed duration.",
+                "Call to {} completed. Credits deducted using backend pricing.",
                 payload.phone_number
             )
         } else {
@@ -157,7 +173,7 @@ pub async fn end_call_session(
 
 pub async fn create_offer(
     State(state): State<AppState>,
-    account: AuthenticatedAccount, // Automatically extracted compile-time authentication context
+    account: AuthenticatedAccount,
     Json(offer): Json<WebRtcOffer>,
 ) -> GatewayResult<Json<WebRtcAnswer>> {
     let call_id = offer
@@ -173,7 +189,6 @@ pub async fn create_offer(
         "Processing real-time WebRTC signaling handshake"
     );
 
-    // 1. ATOMIC IDENTITY CHECK: Read cached balance in Redis for the specific authenticated workspace
     let user_redis_key = format!("client:balance:{}", account.account_id);
     let current_credits = cache::get_credits(&state.cache, &user_redis_key).await?;
 
@@ -185,21 +200,19 @@ pub async fn create_offer(
         return Err(GatewayError::InsufficientCredits);
     }
 
-    // 2. BACKEND TELNYX OUTBOUND ROUTING BUILD [cite: 42, 61, 147]
-    // We forward the application WebRTC stream parameters into Telnyx's Outbound Call Engine [cite: 42]
     let telnyx_url = format!("{}/v2/calls", state.config.telnyx_base_url);
 
     let telnyx_payload = json!({
-        "connection_id": "YOUR_TELNYX_SIP_CONNECTION_ID", // Programmatic SIP engine reference [cite: 147]
+        "connection_id": "YOUR_TELNYX_SIP_CONNECTION_ID",
         "to": offer.destination_number,
-        "from": "+1234567890", // Your verified programmatic outbound Caller ID [cite: 150]
-        "client_state": call_id, // Pin our internal tracking identifier to the carrier webhook [cite: 150]
+        "from": "+1234567890",
+        "client_state": call_id,
     });
 
     let response = state
         .http
         .post(&telnyx_url)
-        .bearer_auth(&state.config.jwt_secret) // Secure master key binding reference used [cite: 61]
+        .bearer_auth(&state.config.jwt_secret)
         .json(&telnyx_payload)
         .send()
         .await?;
@@ -213,7 +226,6 @@ pub async fn create_offer(
         )));
     }
 
-    // Extract Telnyx reference handle to trace call duration for real-time burning later [cite: 81, 150]
     let resp_json: serde_json::Value = response.json().await?;
     let telnyx_control_id = resp_json["data"]["call_control_id"]
         .as_str()
