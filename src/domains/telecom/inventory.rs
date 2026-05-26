@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Query, State},
+    extract::{Path, Query, State},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -144,6 +144,30 @@ pub struct NumberRenewalResponse {
     pub renewed: usize,
     pub past_due: usize,
     pub items: Vec<NumberRenewalItem>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+struct NumberSubscriptionRecord {
+    id: Uuid,
+    account_id: Option<Uuid>,
+    phone_number: String,
+    monthly_fee_credits: Option<f64>,
+    next_renewal_at: Option<chrono::DateTime<chrono::Utc>>,
+    billing_status: Option<String>,
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NumberSubscriptionActionResponse {
+    pub id: Uuid,
+    pub phone_number: String,
+    pub status: String,
+    pub billing_status: String,
+    pub monthly_fee_credits: Option<f64>,
+    pub next_renewal_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -306,6 +330,97 @@ pub async fn list_my_numbers(
     Ok(Json(MyNumbersResponse {
         numbers: records.into_iter().map(MyNumberDto::from).collect(),
     }))
+}
+
+pub async fn cancel_number_subscription(
+    State(state): State<AppState>,
+    account: AuthenticatedAccount,
+    Path(number_id): Path<Uuid>,
+) -> GatewayResult<Json<NumberSubscriptionActionResponse>> {
+    let record = sqlx::query_as::<_, NumberSubscriptionRecord>(
+        r#"
+        update provisioned_numbers
+        set billing_status = 'cancelled',
+            status = 'cancelled',
+            next_renewal_at = null,
+            updated_at = now()
+        where id = $1 and account_id = $2
+        returning id,
+                  account_id,
+                  phone_number,
+                  monthly_fee_credits::double precision as monthly_fee_credits,
+                  next_renewal_at,
+                  billing_status,
+                  status
+        "#,
+    )
+    .bind(number_id)
+    .bind(account.account_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| GatewayError::Upstream("Number subscription not found.".to_string()))?;
+
+    Ok(Json(NumberSubscriptionActionResponse::from_record(
+        record,
+        "Number subscription cancelled. Renewal billing has stopped.".to_string(),
+    )))
+}
+
+pub async fn reactivate_number_subscription(
+    State(state): State<AppState>,
+    account: AuthenticatedAccount,
+    Path(number_id): Path<Uuid>,
+) -> GatewayResult<Json<NumberSubscriptionActionResponse>> {
+    let record = get_user_number_subscription(&state, account.account_id, number_id).await?;
+    let monthly_fee = record.monthly_fee_credits.unwrap_or(0.0);
+
+    if monthly_fee <= 0.0 {
+        return Err(GatewayError::Upstream(
+            "Monthly subscription fee is not configured for this number.".to_string(),
+        ));
+    }
+
+    let cache_key = format!("client:balance:{}", account.account_id);
+    let current_credits = cache::get_credits(&state.cache, &cache_key).await?;
+
+    match current_credits {
+        Some(balance) if balance >= monthly_fee => {
+            cache::increment_credits(&state.cache, &cache_key, -monthly_fee).await?;
+        }
+        _ => return Err(GatewayError::InsufficientCredits),
+    }
+
+    let next_renewal_at = chrono::Utc::now() + chrono::Duration::days(30);
+    let updated = sqlx::query_as::<_, NumberSubscriptionRecord>(
+        r#"
+        update provisioned_numbers
+        set billing_status = 'active',
+            status = 'reserved',
+            next_renewal_at = $1,
+            updated_at = now()
+        where id = $2 and account_id = $3
+        returning id,
+                  account_id,
+                  phone_number,
+                  monthly_fee_credits::double precision as monthly_fee_credits,
+                  next_renewal_at,
+                  billing_status,
+                  status
+        "#,
+    )
+    .bind(next_renewal_at)
+    .bind(number_id)
+    .bind(account.account_id)
+    .fetch_one(&state.db)
+    .await?;
+
+    Ok(Json(NumberSubscriptionActionResponse::from_record(
+        updated,
+        format!(
+            "Number subscription reactivated. {} Credits deducted for the next month.",
+            monthly_fee
+        ),
+    )))
 }
 
 pub async fn process_due_number_renewals(
@@ -596,6 +711,32 @@ async fn save_provisioned_number(
     Ok(())
 }
 
+async fn get_user_number_subscription(
+    state: &AppState,
+    account_id: Uuid,
+    number_id: Uuid,
+) -> GatewayResult<NumberSubscriptionRecord> {
+    sqlx::query_as::<_, NumberSubscriptionRecord>(
+        r#"
+        select id,
+               account_id,
+               phone_number,
+               monthly_fee_credits::double precision as monthly_fee_credits,
+               next_renewal_at,
+               billing_status,
+               status
+        from provisioned_numbers
+        where id = $1 and account_id = $2
+        limit 1
+        "#,
+    )
+    .bind(number_id)
+    .bind(account_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| GatewayError::Upstream("Number subscription not found.".to_string()))
+}
+
 async fn mark_number_past_due(state: &AppState, number_id: Uuid) -> GatewayResult<()> {
     sqlx::query(
         r#"
@@ -611,6 +752,22 @@ async fn mark_number_past_due(state: &AppState, number_id: Uuid) -> GatewayResul
     .await?;
 
     Ok(())
+}
+
+impl NumberSubscriptionActionResponse {
+    fn from_record(record: NumberSubscriptionRecord, message: String) -> Self {
+        Self {
+            id: record.id,
+            phone_number: record.phone_number,
+            status: record.status,
+            billing_status: record
+                .billing_status
+                .unwrap_or_else(|| "unknown".to_string()),
+            monthly_fee_credits: record.monthly_fee_credits,
+            next_renewal_at: record.next_renewal_at,
+            message,
+        }
+    }
 }
 
 impl From<NumberPricingRecord> for NumberPricingDto {
