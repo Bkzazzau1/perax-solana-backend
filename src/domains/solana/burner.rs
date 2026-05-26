@@ -1,7 +1,7 @@
 // src/domains/solana/burner.rs
 use serde_json::json;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::{
@@ -17,21 +17,18 @@ pub fn spawn_daily_burner(state: AppState) {
         info!(
             treasury = %state.trading_co_wallet.treasury_address,
             burn_execution_mode = %state.config.burn_execution_mode.as_str(),
-            "Starting production dynamic burn and market stabilization engine"
+            "Starting PEX daily burn decision worker"
         );
 
         loop {
-            // Run on a 24-hour cycle as specified in the Pera-X economic policy.
             tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
 
-            info!("Initiating daily tokenomic validation cycle...");
+            info!("Initiating daily PEX burn decision cycle...");
 
-            // 1. DYNAMIC BURN DECLARATION
             if let Err(err) = declare_daily_revenue_burn(&state).await {
                 error!(error = %err, "Failed to complete daily token burn declaration sequence");
             }
 
-            // 2. APPROVED BURN EXECUTION
             if state.config.burn_execution_mode.allows_approved_execution() {
                 if let Err(err) = execute_approved_burn_decisions(&state).await {
                     error!(error = %err, "Failed to execute approved burn decisions");
@@ -39,20 +36,13 @@ pub fn spawn_daily_burner(state: AppState) {
             } else {
                 info!(
                     burn_execution_mode = %state.config.burn_execution_mode.as_str(),
-                    "Burn execution disabled by configuration. Decisions will remain declared or approved until mode is changed."
+                    "Burn execution disabled by configuration. Decisions remain declared or approved until mode is changed."
                 );
-            }
-
-            // 3. ALGORITHMIC MARKET MODERATION
-            if let Err(err) = evaluate_market_stabilization(&state).await {
-                error!(error = %err, "Failed to execute market stabilization check");
             }
         }
     });
 }
 
-/// Calculates and stores the daily burn decision.
-/// It does not execute a real burn until the decision is approved and execution mode allows it.
 async fn declare_daily_revenue_burn(state: &AppState) -> Result<(), GatewayError> {
     let trading_company_balance = fetch_trading_company_token_balance(state).await?;
 
@@ -92,7 +82,6 @@ async fn declare_daily_revenue_burn(state: &AppState) -> Result<(), GatewayError
     Ok(())
 }
 
-/// Executes only approved burn decisions. Declared decisions must be approved first.
 async fn execute_approved_burn_decisions(state: &AppState) -> Result<(), GatewayError> {
     let approved_decisions = sqlx::query_as::<_, ApprovedBurnDecision>(
         r#"
@@ -127,8 +116,6 @@ async fn execute_approved_burn_decisions(state: &AppState) -> Result<(), Gateway
             "Executing approved Pera-X burn decision"
         );
 
-        // In production, this should create and sign an SPL-Token burn instruction
-        // from the Trading Company token account and submit it via Solana RPC.
         let tx_signature = "MOCK_SOLANA_BURN_SIGNATURE_HASH";
 
         mark_burn_decision_executed(state, decision.id, tx_signature).await?;
@@ -138,7 +125,7 @@ async fn execute_approved_burn_decisions(state: &AppState) -> Result<(), Gateway
             signature = %tx_signature,
             burned_amount = %decision.tokens_to_burn,
             burn_rate_percent = %format!("{:.2}%", decision.burn_rate_percent),
-            "Approved daily burn finalized on-chain and persisted"
+            "Approved daily burn finalized and persisted"
         );
     }
 
@@ -259,12 +246,6 @@ async fn fetch_trading_company_token_balance(state: &AppState) -> Result<f64, Ga
 }
 
 fn build_market_policy_input(trading_company_balance: f64) -> MarketPolicyInput {
-    // TODO: Replace these baseline scores with real data from:
-    // - DEX pool/liquidity feeds
-    // - utility transaction volume
-    // - holder analytics
-    // - Trading Company wallet health thresholds
-    // - treasury and revenue dashboards
     let trading_company_wallet_score = if trading_company_balance >= 1_000_000.0 {
         1.0
     } else if trading_company_balance >= 100_000.0 {
@@ -282,44 +263,4 @@ fn build_market_policy_input(trading_company_balance: f64) -> MarketPolicyInput 
         holder_pressure_score: 0.50,
         trading_company_wallet_score,
     }
-}
-
-/// Monitors the open DEX pool price. If price breaches the policy threshold,
-/// it can trigger calculated liquidity support or market-condition-based unlocking.
-async fn evaluate_market_stabilization(_state: &AppState) -> Result<(), GatewayError> {
-    // Query target DEX pool price in production, for example Meteora/Jupiter route pricing.
-    let current_dex_price = 0.00012;
-    let launch_price = 0.00009;
-    let target_ceiling = launch_price * 3.0;
-
-    info!(
-        price = %current_dex_price,
-        floor = %launch_price,
-        ceiling = %target_ceiling,
-        "Evaluating market expansion parameters"
-    );
-
-    if current_dex_price >= target_ceiling {
-        warn!(
-            price = %current_dex_price,
-            "Price ceiling crossed. Market-condition unlock review required."
-        );
-
-        // Unlocking does not mean selling. This should become a policy-reviewed movement
-        // from locked allocation wallets toward Trading Company, liquidity, or reserve support.
-        let max_release_allowance = 100_000.0;
-        let trading_company_share = max_release_allowance * 0.50;
-
-        info!(
-            release_allowance = %max_release_allowance,
-            trading_company_share = %trading_company_share,
-            "Calculated conditional unlock review allocation"
-        );
-    } else {
-        info!(
-            "Market fluctuations remaining healthy within expected standard volatility boundaries."
-        );
-    }
-
-    Ok(())
 }
