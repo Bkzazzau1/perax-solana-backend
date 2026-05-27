@@ -9,5 +9,6 @@ pub mod checkout;
 pub mod credits;
 pub mod payments;
 pub mod pricing;
+pub mod protocol;
 pub mod solana;
 pub mod telecom;
