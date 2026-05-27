@@ -54,6 +54,9 @@ pub async fn record_pex_revenue_event(
     let pex_remaining_amount = round_token_amount(pex_received - pex_burn_amount);
     let revenue_month = current_revenue_month();
 
+    let trading_company_locked_token_account = &state.config.trading_co_treasury;
+    let trading_company_revenue_token_account = &state.config.trading_company_second_wallet;
+
     let mut tx = state.db.begin().await?;
 
     let record = sqlx::query_as::<_, PexRevenueEventRecord>(
@@ -104,8 +107,8 @@ pub async fn record_pex_revenue_event(
     .bind(normalize_reference_hex(&input.reference_hex))
     .bind(input.payer_wallet)
     .bind(input.token_mint)
-    .bind(&state.config.trading_co_treasury)
-    .bind(&state.config.trading_company_second_wallet)
+    .bind(trading_company_locked_token_account)
+    .bind(trading_company_revenue_token_account)
     .bind(pex_received)
     .bind(credits_granted)
     .bind(burn_percentage)
@@ -120,7 +123,7 @@ pub async fn record_pex_revenue_event(
     upsert_monthly_sell_cap_ledger(
         &mut tx,
         revenue_month,
-        &state.config.trading_company_second_wallet,
+        trading_company_revenue_token_account,
         pex_received,
         pex_burn_amount,
         pex_remaining_amount,
@@ -162,7 +165,7 @@ pub async fn get_monthly_sell_cap(
 async fn upsert_monthly_sell_cap_ledger(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     revenue_month: NaiveDate,
-    second_wallet: &str,
+    revenue_token_account: &str,
     pex_received: f64,
     pex_burned: f64,
     pex_remaining: f64,
@@ -197,7 +200,7 @@ async fn upsert_monthly_sell_cap_ledger(
         "#,
     )
     .bind(revenue_month)
-    .bind(second_wallet)
+    .bind(revenue_token_account)
     .bind(pex_received)
     .bind(pex_burned)
     .bind(pex_remaining)
