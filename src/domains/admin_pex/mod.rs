@@ -9,8 +9,8 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/admin/api/pex/revenue-events", get(list_pex_revenue_events))
         .route("/admin/api/pex/monthly-sell-cap", get(list_monthly_sell_cap))
-        .route("/admin/api/pex/sell-events", get(list_second_wallet_sell_events))
-        .route("/admin/api/pex/sell-events/declare", post(declare_second_wallet_sale))
+        .route("/admin/api/pex/sell-events", get(list_revenue_token_account_sell_events))
+        .route("/admin/api/pex/sell-events/declare", post(declare_revenue_token_account_sale))
 }
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +27,7 @@ struct PexRevenueEventRecord {
     payer_wallet: Option<String>,
     token_mint: Option<String>,
     trading_company_settlement_account: String,
+    #[serde(rename = "tradingCompanyRevenueTokenAccount")]
     trading_company_second_wallet: String,
     pex_received: f64,
     credits_granted: f64,
@@ -98,6 +99,7 @@ struct SellCapQuery {
 struct MonthlySellCapRecord {
     id: Uuid,
     revenue_month: NaiveDate,
+    #[serde(rename = "tradingCompanyRevenueTokenAccount")]
     trading_company_second_wallet: String,
     monthly_revenue_pex: f64,
     monthly_burned_pex: f64,
@@ -170,7 +172,7 @@ struct DeclareSellEventResponse {
     message: String,
 }
 
-async fn declare_second_wallet_sale(
+async fn declare_revenue_token_account_sale(
     State(state): State<AppState>,
     Json(request): Json<DeclareSellEventRequest>,
 ) -> GatewayResult<Json<DeclareSellEventResponse>> {
@@ -289,9 +291,10 @@ struct SellEventsQuery {
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
-struct SecondWalletSellEventRecord {
+struct RevenueTokenAccountSellEventRecord {
     id: Uuid,
     revenue_month: NaiveDate,
+    #[serde(rename = "tradingCompanyRevenueTokenAccount")]
     trading_company_second_wallet: String,
     pex_sell_amount: f64,
     sell_reason: Option<String>,
@@ -301,19 +304,19 @@ struct SecondWalletSellEventRecord {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SecondWalletSellEventsResponse {
+struct RevenueTokenAccountSellEventsResponse {
     count: usize,
-    events: Vec<SecondWalletSellEventRecord>,
+    events: Vec<RevenueTokenAccountSellEventRecord>,
 }
 
-async fn list_second_wallet_sell_events(
+async fn list_revenue_token_account_sell_events(
     State(state): State<AppState>,
     Query(query): Query<SellEventsQuery>,
-) -> GatewayResult<Json<SecondWalletSellEventsResponse>> {
+) -> GatewayResult<Json<RevenueTokenAccountSellEventsResponse>> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let revenue_month = query.revenue_month.unwrap_or_else(current_revenue_month);
 
-    let events = sqlx::query_as::<_, SecondWalletSellEventRecord>(
+    let events = sqlx::query_as::<_, RevenueTokenAccountSellEventRecord>(
         r#"
         select
             id,
@@ -334,7 +337,7 @@ async fn list_second_wallet_sell_events(
     .fetch_all(&state.db)
     .await?;
 
-    Ok(Json(SecondWalletSellEventsResponse {
+    Ok(Json(RevenueTokenAccountSellEventsResponse {
         count: events.len(),
         events,
     }))
