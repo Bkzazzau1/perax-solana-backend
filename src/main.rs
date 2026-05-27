@@ -34,6 +34,7 @@ async fn main() -> GatewayResult<()> {
         .merge(domains::payments::router())
         .merge(domains::pricing::router())
         .merge(domains::protocol::router())
+        .merge(domains::utility_catalog::router())
         .merge(domains::ai::routes::router())
         .merge(domains::credits::routes::router())
         .merge(domains::checkout::routes::router())
