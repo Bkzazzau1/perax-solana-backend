@@ -69,8 +69,14 @@ impl Config {
                 "C:\\PROJECTS\\Pera-X-ecosystem\\perax-contracts",
             ),
             perax_program_id: env_or("PERAX_PROGRAM_ID", "11111111111111111111111111111111"),
-            trading_co_treasury: required("TRADING_CO_TREASURY")?,
-            trading_company_second_wallet: required("TRADING_COMPANY_SECOND_WALLET")?,
+            trading_co_treasury: required_any(&[
+                "TRADING_COMPANY_TOKEN_ACCOUNT",
+                "TRADING_CO_TREASURY",
+            ])?,
+            trading_company_second_wallet: required_any(&[
+                "TRADING_COMPANY_REVENUE_TOKEN_ACCOUNT",
+                "TRADING_COMPANY_SECOND_WALLET",
+            ])?,
             pex_immediate_burn_percentage: parse_percentage_env("PEX_IMMEDIATE_BURN_PERCENTAGE", 10.0)?,
             pex_monthly_sell_cap_percentage: parse_percentage_env("PEX_MONTHLY_SELL_CAP_PERCENTAGE", 50.0)?,
             burn_execution_mode,
@@ -97,11 +103,17 @@ impl Config {
             ));
         }
 
-        validate_wallet_like("TRADING_CO_TREASURY", &self.trading_co_treasury)?;
+        validate_wallet_like("TRADING_COMPANY_TOKEN_ACCOUNT", &self.trading_co_treasury)?;
         validate_wallet_like(
-            "TRADING_COMPANY_SECOND_WALLET",
+            "TRADING_COMPANY_REVENUE_TOKEN_ACCOUNT",
             &self.trading_company_second_wallet,
         )?;
+
+        if self.trading_co_treasury == self.trading_company_second_wallet {
+            return Err(GatewayError::Config(
+                "Trading Company locked account and revenue account must be different".to_string(),
+            ));
+        }
 
         if !(0.0..=100.0).contains(&self.pex_immediate_burn_percentage) {
             return Err(GatewayError::Config(
@@ -123,6 +135,21 @@ impl Config {
 
 fn required(key: &'static str) -> GatewayResult<String> {
     env::var(key).map_err(|_| GatewayError::Config(format!("{key} is required")))
+}
+
+fn required_any(keys: &[&'static str]) -> GatewayResult<String> {
+    for key in keys {
+        if let Ok(value) = env::var(key) {
+            if !value.trim().is_empty() {
+                return Ok(value);
+            }
+        }
+    }
+
+    Err(GatewayError::Config(format!(
+        "one of {} is required",
+        keys.join(" or ")
+    )))
 }
 
 fn env_or(key: &'static str, fallback: &'static str) -> String {
@@ -147,7 +174,7 @@ fn validate_wallet_like(key: &'static str, value: &str) -> GatewayResult<()> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.starts_with("replace-with-") || trimmed.len() < 32 {
         return Err(GatewayError::Config(format!(
-            "{key} must be configured with a real Solana SPL token account or wallet address"
+            "{key} must be configured with a real Solana account address"
         )));
     }
 
