@@ -1,0 +1,131 @@
+name: Pera-X Backend CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "migrations/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/perax-backend-ci.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "migrations/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/perax-backend-ci.yml"
+  workflow_dispatch:
+
+jobs:
+  backend:
+    name: Check and runtime smoke test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: perax
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d perax"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    env:
+      HOST: 127.0.0.1
+      PORT: 8080
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/perax
+      REDIS_URL: memory://local
+      SOLANA_RPC_URL: https://api.devnet.solana.com
+      SOLANA_WS_URL: wss://api.devnet.solana.com
+      PERAX_ANCHOR_WORKSPACE: /tmp/perax-contracts
+      PERAX_PROGRAM_ID: 11111111111111111111111111111111
+      TRADING_COMPANY_TOKEN_ACCOUNT: 11111111111111111111111111111112
+      TRADING_COMPANY_REVENUE_TOKEN_ACCOUNT: 11111111111111111111111111111113
+      PEX_IMMEDIATE_BURN_PERCENTAGE: 10
+      PEX_MONTHLY_SELL_CAP_PERCENTAGE: 50
+      BURN_EXECUTION_MODE: manual
+      JWT_SECRET: ci-only-jwt-secret-please-never-use-in-prod-1234567890
+      CLAUDE_BASE_URL: https://api.anthropic.com
+      COPYLEAKS_BASE_URL: https://api.copyleaks.com
+      TELNYX_BASE_URL: https://api.telnyx.com
+      RUST_LOG: info
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Wait for PostgreSQL
+        run: |
+          for i in {1..30}; do
+            if pg_isready -h 127.0.0.1 -p 5432 -U postgres -d perax; then
+              echo "PostgreSQL is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "PostgreSQL did not become ready"
+          exit 1
+        env:
+          PGPASSWORD: postgres
+
+      - name: Cargo check
+        run: cargo check
+
+      - name: Run backend smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run > /tmp/perax-backend.log 2>&1 &
+          APP_PID=$!
+
+          cleanup() {
+            kill "$APP_PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          for i in {1..60}; do
+            if curl -fsS http://127.0.0.1:8080/healthz; then
+              echo "Backend health check passed"
+              exit 0
+            fi
+
+            if ! kill -0 "$APP_PID" 2>/dev/null; then
+              echo "Backend process exited before health check passed"
+              echo "== Backend log =="
+              cat /tmp/perax-backend.log || true
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          echo "Backend did not become healthy in time"
+          echo "== Backend log =="
+          cat /tmp/perax-backend.log || true
+          exit 1
