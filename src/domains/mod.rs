@@ -12,3 +12,4 @@ pub mod pricing;
 pub mod protocol;
 pub mod solana;
 pub mod telecom;
+pub mod utility_catalog;
