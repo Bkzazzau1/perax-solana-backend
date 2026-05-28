@@ -1,53 +1,80 @@
 # Pera-X Utility Gateway
 
-Axum 0.8 service scaffold for high-throughput WebRTC signaling, Solana settlement tracking, and downstream B2B proxy integrations.
+Axum 0.8 service scaffold for high-throughput WebRTC signaling, Solana settlement tracking, Credits funding, Trading Company revenue tracking, and downstream B2B proxy integrations.
 
 ## Layout
 
 - `src/domains/auth`: virtual API key extraction and account verification.
 - `src/domains/b2b_gateway`: Claude and Copyleaks proxy entrypoints.
 - `src/domains/payments`: utility payment confirmation, grant flow, Trading Company status, and admin test routes.
-- `src/domains/solana`: background treasury listener, dynamic burn policy, payment event ingestion, and settlement burner workers.
+- `src/domains/solana`: background treasury listener, dynamic burn policy, payment event ingestion, market-condition monitoring, revenue ledger, and settlement burner workers.
 - `src/domains/telecom`: Telnyx-facing voice, WebRTC, and SMS routes.
+- `src/domains/credits`: Credits purchase flow for PEX, card, stablecoin, and virtual account funding.
 - `src/infra`: PostgreSQL and Redis connection setup.
 - `scripts`: local helper scripts for runtime testing.
 
-## Anchor Contract Link
+## Smart Contract Alignment
 
-The backend is linked to the local Anchor workspace at:
+The backend is aligned with the current Pera-X Anchor program.
+
+Current Pera-X program id:
 
 ```text
-C:\PROJECTS\smartcontract PEX\perax-ecosystem\perax-contracts
+FqEiSx5vujh2vi3yk12NaZMXhjMSaKovGUuzcKiAgshn
 ```
 
-The current Anchor program id is still the starter placeholder:
+Current devnet state PDA:
+
+```text
+8LNUe8ud9Lrtt1HmuS132YoGs5tBNEeWeviNJwWDkHWT
+```
+
+Current devnet PEX mint:
+
+```text
+DnkAW3B1ckzW6eimgSBNPK3XTt83wMiZRETy8iF3gdsn
+```
+
+The backend must never use the old placeholder program id:
 
 ```text
 11111111111111111111111111111111
 ```
 
-Install the Solana and Anchor CLIs, then run `anchor keys sync` and `anchor build` in the Anchor workspace. After that, copy the real program id into `PERAX_PROGRAM_ID` in `.env`.
+## PEX Token Policy
 
-## Trading Company SPL Token Account
+| Item | Value |
+|---|---:|
+| Token | Pera-X |
+| Symbol | PEX |
+| Supply | 1,000,000,000 PEX |
+| Decimals | 6 |
+| Initial Price | $0.000012 |
+| Initial Valuation | $12,000 |
+| Initial Liquidity | 380,000,000 PEX + $4,560 USDC |
+| Liquidity Venue | Meteora DLMM |
+| Unlock Authority | Market-condition oracle only |
+| Manual/Multisig Release Approval | Disabled |
 
-`TRADING_CO_TREASURY` must be the **Trading Company SPL token account** that holds Pera-X tokens.
+## Trading Company SPL Token Accounts
 
-It is **not** the normal wallet address. On Solana, the wallet owner controls one or more SPL token accounts. For Pera-X utility flow, the backend needs the SPL token account that receives, holds, and later burns approved Pera-X tokens.
+The backend separates the Trading Company locked/strategic SPL token account from the Trading Company revenue SPL token account.
 
-This account is used for:
+```text
+TRADING_COMPANY_TOKEN_ACCOUNT = locked/strategic account
+TRADING_COMPANY_REVENUE_TOKEN_ACCOUNT = revenue account for PEX-for-Credits payments and burns
+```
+
+They must be different.
+
+These accounts are used for:
 
 ```text
 1. Confirming Pera-X utility payments
 2. Matching payments sent by the smart contract
-3. Holding Trading Company utility tokens
-4. Approved burn execution from Trading Company balance
+3. Holding Trading Company utility/revenue tokens
+4. Approved burn execution from Trading Company revenue balance
 5. Future buyback/top-up tracking
-```
-
-Example environment value:
-
-```env
-TRADING_CO_TREASURY=replace-with-trading-company-spl-token-account
 ```
 
 Trading Company status endpoint:
@@ -56,7 +83,23 @@ Trading Company status endpoint:
 GET /admin/api/trading-company-status
 ```
 
-This endpoint confirms whether `TRADING_CO_TREASURY` is still a placeholder or has been replaced with a real Trading Company SPL token account.
+## Market-Condition Release Policy
+
+Pera-X uses oracle-controlled market-condition release approval.
+
+```text
+Market bot monitors market every 10 minutes
+Oracle verifies TWAP, liquidity, volume, buy pressure, cooldown, daily cap, monthly cap, and business purpose
+Oracle records release approval on-chain when all gates are satisfied
+ReleaseRecord PDA prevents duplicate release IDs
+Emergency pause can stop the system if market/security risk is detected
+```
+
+The backend config must keep:
+
+```env
+PEX_UNLOCK_REQUIRES_MANUAL_APPROVAL=false
+```
 
 ## Burn Execution Policy
 
@@ -71,18 +114,18 @@ Use `manual` for development and early testing. Use `approved` only when product
 
 ## Utility Payment Confirmation Flow
 
-The smart contract sends Pera-X utility payments to the Trading Company token account and emits a reference. The backend stores and confirms that reference before granting service access.
+The smart contract sends Pera-X utility payments to the Trading Company revenue token account and emits a reference. The backend stores and confirms that reference before granting service access.
 
 ```text
 User pays Pera-X on-chain
         ↓
-Smart contract sends tokens to Trading Company SPL token account
+Smart contract sends tokens to Trading Company revenue SPL token account
         ↓
-Backend ingests the utility payment reference
+Backend ingests/verifies the utility payment reference
         ↓
 Payment status becomes confirmed
         ↓
-Backend grants the requested service/access
+Backend grants the requested service/access or Credits
         ↓
 Payment status becomes granted
 ```
@@ -110,7 +153,13 @@ Set the required environment values:
 
 ```powershell
 $env:DATABASE_URL="postgres://postgres:postgres@localhost:5432/perax"
-$env:TRADING_CO_TREASURY="replace-with-trading-company-spl-token-account"
+$env:SOLANA_RPC_URL="https://api.devnet.solana.com"
+$env:PERAX_PROGRAM_ID="FqEiSx5vujh2vi3yk12NaZMXhjMSaKovGUuzcKiAgshn"
+$env:PERAX_STATE_PDA="8LNUe8ud9Lrtt1HmuS132YoGs5tBNEeWeviNJwWDkHWT"
+$env:PEX_MINT_ADDRESS="DnkAW3B1ckzW6eimgSBNPK3XTt83wMiZRETy8iF3gdsn"
+$env:TRADING_COMPANY_TOKEN_ACCOUNT="replace-with-locked-strategic-spl-token-account"
+$env:TRADING_COMPANY_REVENUE_TOKEN_ACCOUNT="replace-with-revenue-spl-token-account"
+$env:PEX_UNLOCK_REQUIRES_MANUAL_APPROVAL="false"
 $env:JWT_SECRET="replace-with-at-least-32-characters"
 $env:BURN_EXECUTION_MODE="manual"
 cargo run
