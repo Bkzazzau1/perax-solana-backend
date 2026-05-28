@@ -191,6 +191,84 @@ pub async fn build_credit_quote(
     Ok(row_to_quote(quote, input.funding_method, input.funding_method.asset_code(), policy.pex_price_source))
 }
 
+pub async fn get_credit_quote_by_reference(
+    state: &AppState,
+    quote_reference: &str,
+) -> GatewayResult<CreditQuote> {
+    let row = sqlx::query_as::<_, CreditQuoteRow>(
+        r#"
+        select
+            id,
+            quote_reference,
+            funding_method,
+            requested_credits::float8 as requested_credits,
+            discount_percentage::float8 as discount_percentage,
+            promo_code,
+            final_credits::float8 as final_credits,
+            usd_value::float8 as usd_value,
+            pex_price_usd::float8 as pex_price_usd,
+            pex_required::float8 as pex_required,
+            fiat_required::float8 as fiat_required,
+            burn_percentage::float8 as burn_percentage,
+            burn_usd_value::float8 as burn_usd_value,
+            status
+        from credit_purchase_quotes
+        where quote_reference = $1
+        limit 1
+        "#,
+    )
+    .bind(quote_reference.trim())
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| GatewayError::Upstream("credit quote not found".to_string()))?;
+
+    let method = parse_funding_method(&row.funding_method)
+        .ok_or_else(|| GatewayError::Upstream("stored quote has invalid funding method".to_string()))?;
+    Ok(row_to_quote(row, method, method.asset_code(), "stored_quote".to_string()))
+}
+
+pub async fn mark_credit_quote_accepted(
+    state: &AppState,
+    quote_reference: &str,
+) -> GatewayResult<()> {
+    let result = sqlx::query(
+        r#"
+        update credit_purchase_quotes
+        set status = 'accepted', updated_at = now()
+        where quote_reference = $1 and status = 'quoted'
+        "#,
+    )
+    .bind(quote_reference.trim())
+    .execute(&state.db)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(GatewayError::Upstream(
+            "credit quote is not available for acceptance or was already used".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+pub async fn mark_credit_quote_credited(
+    state: &AppState,
+    quote_reference: &str,
+) -> GatewayResult<()> {
+    sqlx::query(
+        r#"
+        update credit_purchase_quotes
+        set status = 'credited', updated_at = now()
+        where quote_reference = $1 and status in ('quoted', 'accepted')
+        "#,
+    )
+    .bind(quote_reference.trim())
+    .execute(&state.db)
+    .await?;
+
+    Ok(())
+}
+
 async fn get_active_credit_policy(state: &AppState) -> GatewayResult<CreditPricingPolicyRecord> {
     sqlx::query_as::<_, CreditPricingPolicyRecord>(
         r#"
