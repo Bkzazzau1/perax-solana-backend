@@ -1,5 +1,7 @@
 // src/domains/solana/burner.rs
-use std::time::Duration;
+
+use std::{env, time::Duration};
+
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -19,7 +21,10 @@ pub fn spawn_daily_burner(state: AppState) {
             info!("Checking system-controlled daily realized-revenue burn schedule...");
 
             if let Err(err) = inspect_daily_realized_burn_schedule(&state).await {
-                error!(error = %err, "Failed to inspect daily realized-revenue burn schedule");
+                error!(
+                    error = %err,
+                    "Failed to inspect daily realized-revenue burn schedule"
+                );
             }
         }
     });
@@ -52,28 +57,49 @@ async fn inspect_daily_realized_burn_schedule(state: &AppState) -> Result<(), Ga
 
     for burn in scheduled_burns {
         if burn.burn_amount_pex <= 0.0 || burn.eligible_revenue_amount_pex <= 0.0 {
-            info!(
-                burn_id = %burn.id,
-                "Skipping scheduled burn with zero eligible revenue or zero burn amount."
-            );
+            mark_burn_failed(
+                state,
+                burn.id,
+                "Zero eligible revenue or zero burn amount",
+            )
+            .await?;
             continue;
         }
 
-        let params = ContractBurnParamsPreview::from_scheduled_burn(&burn);
+        let params = ContractBurnParams::try_from_scheduled_burn(&burn)?;
 
         info!(
             burn_id = %burn.id,
-            decision_id_hex = %burn.decision_id_hex.as_deref().unwrap_or("missing"),
+            decision_id_hex = %params.decision_id_hex,
             amount_minor_units = %params.amount,
             eligible_revenue_minor_units = %params.eligible_revenue_amount,
             burn_rate_bps = %params.burn_rate_bps,
             market_health_score = %params.market_health_score,
             observed_at = %params.observed_at,
             burn_execution_mode = %state.config.burn_execution_mode.as_str(),
-            "Daily burn is ready for system/oracle smart-contract execution. Admin is view-only."
+            "Daily burn is ready for execute_market_condition_burn smart-contract execution."
         );
 
-        mark_burn_ready_for_contract_execution(state, burn.id).await?;
+        // Manual mode means: prepare and log only. No on-chain execution.
+        if !state.config.burn_execution_mode.allows_approved_execution() {
+            continue;
+        }
+
+        match execute_contract_burn(state, &params).await {
+            Ok(signature) => {
+                mark_burn_executed(state, burn.id, &signature).await?;
+
+                info!(
+                    burn_id = %burn.id,
+                    signature = %signature,
+                    "Daily market-condition burn executed and recorded."
+                );
+            }
+            Err(err) => {
+                mark_burn_failed(state, burn.id, &err.to_string()).await?;
+                return Err(err);
+            }
+        }
     }
 
     Ok(())
@@ -91,7 +117,8 @@ struct ScheduledDailyBurn {
 }
 
 #[derive(Debug)]
-struct ContractBurnParamsPreview {
+struct ContractBurnParams {
+    decision_id_hex: String,
     amount: u64,
     eligible_revenue_amount: u64,
     burn_rate_bps: u16,
@@ -99,30 +126,153 @@ struct ContractBurnParamsPreview {
     observed_at: i64,
 }
 
-impl ContractBurnParamsPreview {
-    fn from_scheduled_burn(burn: &ScheduledDailyBurn) -> Self {
-        Self {
-            amount: pex_to_minor_units(burn.burn_amount_pex),
-            eligible_revenue_amount: pex_to_minor_units(burn.eligible_revenue_amount_pex),
-            burn_rate_bps: burn.burn_rate_bps.clamp(0, 10_000) as u16,
-            market_health_score: burn.market_health_score.clamp(0, 100) as u8,
-            observed_at: burn.observed_at_unix.unwrap_or_default(),
+impl ContractBurnParams {
+    fn try_from_scheduled_burn(burn: &ScheduledDailyBurn) -> Result<Self, GatewayError> {
+        let decision_id_hex = burn
+            .decision_id_hex
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                GatewayError::Config("scheduled burn is missing decision_id_hex".to_string())
+            })?
+            .trim_start_matches("0x")
+            .to_lowercase();
+
+        validate_decision_id_hex(&decision_id_hex)?;
+
+        let amount = pex_to_minor_units(burn.burn_amount_pex);
+        let eligible_revenue_amount = pex_to_minor_units(burn.eligible_revenue_amount_pex);
+        let burn_rate_bps = burn.burn_rate_bps.clamp(0, 10_000) as u16;
+        let market_health_score = burn.market_health_score.clamp(0, 100) as u8;
+        let observed_at = burn.observed_at_unix.unwrap_or_default();
+
+        if amount == 0 || eligible_revenue_amount == 0 {
+            return Err(GatewayError::Config(
+                "burn amount and eligible revenue amount must be greater than zero".to_string(),
+            ));
         }
+
+        if observed_at <= 0 {
+            return Err(GatewayError::Config(
+                "scheduled burn observed_at is missing or invalid".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            decision_id_hex,
+            amount,
+            eligible_revenue_amount,
+            burn_rate_bps,
+            market_health_score,
+            observed_at,
+        })
     }
 }
 
-async fn mark_burn_ready_for_contract_execution(
+async fn execute_contract_burn(
+    state: &AppState,
+    params: &ContractBurnParams,
+) -> Result<String, GatewayError> {
+    let executor_url = env::var("PERAX_SUPPLY_CONTROL_EXECUTOR_URL")
+        .or_else(|_| env::var("PERAX_BURN_EXECUTOR_URL"))
+        .map(|value| value.trim().to_string())
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            GatewayError::Config(
+                "PERAX_SUPPLY_CONTROL_EXECUTOR_URL is required when BURN_EXECUTION_MODE=approved"
+                    .to_string(),
+            )
+        })?;
+
+    let payload = serde_json::json!({
+        "solanaRpcUrl": state.config.solana_rpc_url,
+        "programId": state.config.perax_program_id,
+        "statePda": state.config.perax_state_pda,
+        "pexMintAddress": state.config.pex_mint_address,
+        "tradingCompanyRevenueTokenAccount": state.config.trading_company_second_wallet,
+        "decisionIdHex": params.decision_id_hex,
+        "amountBaseUnits": params.amount,
+        "eligibleRevenueBaseUnits": params.eligible_revenue_amount,
+        "burnRateBps": params.burn_rate_bps,
+        "marketHealthScore": params.market_health_score,
+        "observedAtUnix": params.observed_at,
+    });
+
+    let mut request = state.http.post(executor_url).json(&payload);
+
+    if let Ok(token) = env::var("PERAX_SUPPLY_CONTROL_EXECUTOR_TOKEN") {
+        let token = token.trim();
+        if !token.is_empty() {
+            request = request.bearer_auth(token);
+        }
+    }
+
+    let response = request.send().await?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await?;
+
+    if !status.is_success() {
+        return Err(GatewayError::Upstream(format!(
+            "supply-control executor failed with status {status}: {body}"
+        )));
+    }
+
+    body.get("signature")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            GatewayError::Upstream(
+                "supply-control executor response must include signature".to_string(),
+            )
+        })
+}
+
+async fn mark_burn_executed(
     state: &AppState,
     burn_id: Uuid,
+    signature: &str,
 ) -> Result<(), GatewayError> {
     sqlx::query(
         r#"
         update pex_daily_realized_burns
-        set burn_status = 'scheduled', updated_at = now()
+        set
+            burn_status = 'executed',
+            onchain_tx_signature = $2,
+            executed_at = now(),
+            execution_error = null,
+            updated_at = now()
         where id = $1 and burn_status = 'scheduled'
         "#,
     )
     .bind(burn_id)
+    .bind(signature)
+    .execute(&state.db)
+    .await?;
+
+    Ok(())
+}
+
+async fn mark_burn_failed(
+    state: &AppState,
+    burn_id: Uuid,
+    reason: &str,
+) -> Result<(), GatewayError> {
+    sqlx::query(
+        r#"
+        update pex_daily_realized_burns
+        set
+            burn_status = 'failed',
+            execution_error = $2,
+            updated_at = now()
+        where id = $1 and burn_status = 'scheduled'
+        "#,
+    )
+    .bind(burn_id)
+    .bind(reason)
     .execute(&state.db)
     .await?;
 
@@ -134,5 +284,17 @@ fn pex_to_minor_units(amount_pex: f64) -> u64 {
         return 0;
     }
 
-    (amount_pex * 1_000_000.0).round().clamp(0.0, u64::MAX as f64) as u64
+    (amount_pex * 1_000_000.0)
+        .round()
+        .clamp(0.0, u64::MAX as f64) as u64
+}
+
+fn validate_decision_id_hex(value: &str) -> Result<(), GatewayError> {
+    if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(GatewayError::Config(
+            "decision_id_hex must be 32 bytes / 64 hex characters".to_string(),
+        ));
+    }
+
+    Ok(())
 }
