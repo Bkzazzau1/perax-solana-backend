@@ -1,9 +1,14 @@
 use chrono::{Datelike, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{error::GatewayResult, state::AppState};
+use crate::{
+    domains::solana::policy::{MarketPolicyInput, calculate_daily_burn_decision},
+    error::GatewayResult,
+    state::AppState,
+};
 
 #[derive(Debug, Clone)]
 pub struct RecordPexRevenueInput {
@@ -49,9 +54,9 @@ pub async fn record_pex_revenue_event(
 ) -> GatewayResult<PexRevenueEventRecord> {
     let pex_received = input.pex_received.max(0.0);
     let credits_granted = input.credits_granted.max(0.0);
-    let burn_percentage = state.config.pex_immediate_burn_percentage;
-    let pex_burn_amount = round_token_amount(pex_received * (burn_percentage / 100.0));
-    let pex_remaining_amount = round_token_amount(pex_received - pex_burn_amount);
+    let legacy_burn_percentage = state.config.pex_immediate_burn_percentage;
+    let legacy_pex_burn_amount = round_token_amount(pex_received * (legacy_burn_percentage / 100.0));
+    let legacy_pex_remaining_amount = round_token_amount(pex_received - legacy_pex_burn_amount);
     let revenue_month = current_revenue_month();
     let revenue_day = current_revenue_day();
 
@@ -116,9 +121,9 @@ pub async fn record_pex_revenue_event(
     .bind(trading_company_revenue_token_account)
     .bind(pex_received)
     .bind(credits_granted)
-    .bind(burn_percentage)
-    .bind(pex_burn_amount)
-    .bind(pex_remaining_amount)
+    .bind(legacy_burn_percentage)
+    .bind(legacy_pex_burn_amount)
+    .bind(legacy_pex_remaining_amount)
     .bind(revenue_month)
     .bind(revenue_day)
     .bind(input.service_code)
@@ -131,8 +136,8 @@ pub async fn record_pex_revenue_event(
         revenue_month,
         trading_company_revenue_token_account,
         pex_received,
-        pex_burn_amount,
-        pex_remaining_amount,
+        legacy_pex_burn_amount,
+        legacy_pex_remaining_amount,
         state.config.pex_monthly_sell_cap_percentage,
     )
     .await?;
@@ -142,7 +147,6 @@ pub async fn record_pex_revenue_event(
         revenue_day,
         trading_company_revenue_token_account,
         pex_received,
-        burn_percentage,
         record.id,
     )
     .await?;
@@ -233,11 +237,14 @@ async fn upsert_daily_realized_burn_schedule(
     revenue_day: NaiveDate,
     revenue_token_account: &str,
     realized_revenue_pex: f64,
-    burn_percentage: f64,
     last_revenue_event_id: Uuid,
 ) -> GatewayResult<()> {
-    let burn_amount = round_token_amount(realized_revenue_pex * (burn_percentage / 100.0));
+    let market_input = build_market_policy_input(realized_revenue_pex);
+    let decision = calculate_daily_burn_decision(market_input);
+    let burn_amount = round_token_amount(realized_revenue_pex * decision.burn_rate);
     let remaining_amount = round_token_amount(realized_revenue_pex - burn_amount);
+    let observed_at = Utc::now();
+    let decision_id_hex = decision_id_hex_for_day(revenue_day, revenue_token_account);
 
     sqlx::query(
         r#"
@@ -245,19 +252,29 @@ async fn upsert_daily_realized_burn_schedule(
             revenue_day,
             trading_company_revenue_account,
             realized_revenue_pex,
+            eligible_revenue_amount_pex,
             burn_percentage,
+            burn_rate_bps,
+            market_health_score,
             burn_amount_pex,
             remaining_revenue_pex,
+            decision_id_hex,
+            observed_at,
             burn_status,
             last_revenue_event_id
-        ) values ($1, $2, $3, $4, $5, $6, 'scheduled', $7)
+        ) values ($1, $2, $3, $3, $4, $5, $6, $7, $8, $9, $10, 'scheduled', $11)
         on conflict (revenue_day) do update
         set
             trading_company_revenue_account = excluded.trading_company_revenue_account,
             realized_revenue_pex = pex_daily_realized_burns.realized_revenue_pex + excluded.realized_revenue_pex,
+            eligible_revenue_amount_pex = pex_daily_realized_burns.eligible_revenue_amount_pex + excluded.eligible_revenue_amount_pex,
             burn_percentage = excluded.burn_percentage,
-            burn_amount_pex = round(((pex_daily_realized_burns.realized_revenue_pex + excluded.realized_revenue_pex) * excluded.burn_percentage / 100)::numeric, 6),
-            remaining_revenue_pex = round(((pex_daily_realized_burns.realized_revenue_pex + excluded.realized_revenue_pex) - ((pex_daily_realized_burns.realized_revenue_pex + excluded.realized_revenue_pex) * excluded.burn_percentage / 100))::numeric, 6),
+            burn_rate_bps = excluded.burn_rate_bps,
+            market_health_score = excluded.market_health_score,
+            burn_amount_pex = round(((pex_daily_realized_burns.eligible_revenue_amount_pex + excluded.eligible_revenue_amount_pex) * excluded.burn_rate_bps / 10000)::numeric, 6),
+            remaining_revenue_pex = round(((pex_daily_realized_burns.eligible_revenue_amount_pex + excluded.eligible_revenue_amount_pex) - ((pex_daily_realized_burns.eligible_revenue_amount_pex + excluded.eligible_revenue_amount_pex) * excluded.burn_rate_bps / 10000))::numeric, 6),
+            decision_id_hex = excluded.decision_id_hex,
+            observed_at = excluded.observed_at,
             burn_status = case
                 when pex_daily_realized_burns.burn_status in ('executed', 'cancelled') then pex_daily_realized_burns.burn_status
                 else 'scheduled'
@@ -269,14 +286,45 @@ async fn upsert_daily_realized_burn_schedule(
     .bind(revenue_day)
     .bind(revenue_token_account)
     .bind(realized_revenue_pex)
-    .bind(burn_percentage)
+    .bind(decision.burn_rate_percent)
+    .bind(decision.burn_rate_bps as i32)
+    .bind(decision.market_health_score_u8 as i32)
     .bind(burn_amount)
     .bind(remaining_amount)
+    .bind(decision_id_hex)
+    .bind(observed_at)
     .bind(last_revenue_event_id)
     .execute(&mut **tx)
     .await?;
 
     Ok(())
+}
+
+fn build_market_policy_input(realized_revenue_pex: f64) -> MarketPolicyInput {
+    let trading_company_wallet_score = if realized_revenue_pex >= 1_000_000.0 {
+        1.0
+    } else if realized_revenue_pex >= 100_000.0 {
+        0.7
+    } else if realized_revenue_pex >= 10_000.0 {
+        0.4
+    } else {
+        0.2
+    };
+
+    MarketPolicyInput {
+        market_health_score: 0.70,
+        liquidity_score: 0.60,
+        utility_usage_score: 0.50,
+        holder_pressure_score: 0.50,
+        trading_company_wallet_score,
+    }
+}
+
+fn decision_id_hex_for_day(revenue_day: NaiveDate, revenue_token_account: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("daily-realized-burn:{revenue_day}:{revenue_token_account}").as_bytes());
+    let digest = hasher.finalize();
+    format!("{:x}", digest)
 }
 
 fn current_revenue_month() -> NaiveDate {
