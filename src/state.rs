@@ -30,7 +30,7 @@ impl AppState {
         let trading_co_wallet = Arc::new(TradingWallet::new(
             config.trading_co_treasury.clone(),
             config.trading_company_second_wallet.clone(),
-            ));
+        ));
         let http = reqwest::Client::new();
 
         Ok(Self {
