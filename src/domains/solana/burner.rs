@@ -1,267 +1,138 @@
 // src/domains/solana/burner.rs
-use serde_json::json;
 use std::time::Duration;
 use tracing::{error, info};
 use uuid::Uuid;
 
-use crate::{
-    domains::solana::policy::{
-        DailyBurnDecision, MarketPolicyInput, calculate_daily_burn_decision,
-    },
-    error::GatewayError,
-    state::AppState,
-};
+use crate::{error::GatewayError, state::AppState};
 
 pub fn spawn_daily_burner(state: AppState) {
     tokio::spawn(async move {
         info!(
             revenue_account = %state.config.trading_company_second_wallet,
             burn_execution_mode = %state.config.burn_execution_mode.as_str(),
-            "Starting PEX daily burn decision worker from revenue account"
+            "Starting PEX system-controlled daily burn worker"
         );
 
         loop {
             tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
 
-            info!("Initiating daily PEX burn decision cycle...");
+            info!("Checking system-controlled daily realized-revenue burn schedule...");
 
-            if let Err(err) = declare_daily_revenue_burn(&state).await {
-                error!(error = %err, "Failed to complete daily token burn declaration sequence");
-            }
-
-            if state.config.burn_execution_mode.allows_approved_execution() {
-                if let Err(err) = execute_approved_burn_decisions(&state).await {
-                    error!(error = %err, "Failed to execute approved burn decisions");
-                }
-            } else {
-                info!(
-                    burn_execution_mode = %state.config.burn_execution_mode.as_str(),
-                    "Burn execution disabled by configuration. Decisions remain declared or approved until mode is changed."
-                );
+            if let Err(err) = inspect_daily_realized_burn_schedule(&state).await {
+                error!(error = %err, "Failed to inspect daily realized-revenue burn schedule");
             }
         }
     });
 }
 
-async fn declare_daily_revenue_burn(state: &AppState) -> Result<(), GatewayError> {
-    let trading_company_balance = fetch_trading_company_revenue_balance(state).await?;
-
-    if trading_company_balance <= 0.0 {
-        info!("No PEX found in Trading Company revenue account. Skipping burn declaration.");
-        return Ok(());
-    }
-
-    let market_input = build_market_policy_input(trading_company_balance);
-    let decision = calculate_daily_burn_decision(market_input);
-    let tokens_to_burn = trading_company_balance * decision.burn_rate;
-
-    let decision_id = persist_burn_decision(
-        state,
-        &decision,
-        trading_company_balance,
-        tokens_to_burn,
-        "declared",
-        None,
-    )
-    .await?;
-
-    info!(
-        decision_id = %decision_id,
-        burn_rate_percent = %format!("{:.2}%", decision.burn_rate_percent),
-        reason = %decision.reason,
-        market_health_score = %decision.market_health_score,
-        liquidity_score = %decision.liquidity_score,
-        utility_usage_score = %decision.utility_usage_score,
-        holder_pressure_score = %decision.holder_pressure_score,
-        trading_company_wallet_score = %decision.trading_company_wallet_score,
-        tokens_to_burn = %tokens_to_burn,
-        burn_execution_mode = %state.config.burn_execution_mode.as_str(),
-        "Daily Pera-X burn policy decision declared from revenue account. Awaiting execution policy."
-    );
-
-    Ok(())
-}
-
-async fn execute_approved_burn_decisions(state: &AppState) -> Result<(), GatewayError> {
-    let approved_decisions = sqlx::query_as::<_, ApprovedBurnDecision>(
+async fn inspect_daily_realized_burn_schedule(state: &AppState) -> Result<(), GatewayError> {
+    let scheduled_burns = sqlx::query_as::<_, ScheduledDailyBurn>(
         r#"
         select
             id,
-            tokens_to_burn::float8 as tokens_to_burn,
-            burn_rate_percent::float8 as burn_rate_percent
-        from daily_burn_decisions
-        where status = 'approved'
-        order by declared_at asc
-        limit 5
+            decision_id_hex,
+            eligible_revenue_amount_pex::float8 as eligible_revenue_amount_pex,
+            burn_amount_pex::float8 as burn_amount_pex,
+            burn_rate_bps,
+            market_health_score,
+            extract(epoch from observed_at)::bigint as observed_at_unix
+        from pex_daily_realized_burns
+        where burn_status = 'scheduled'
+        order by revenue_day asc
+        limit 10
         "#,
     )
     .fetch_all(&state.db)
     .await?;
 
-    if approved_decisions.is_empty() {
-        info!("No approved Pera-X burn decisions awaiting execution.");
+    if scheduled_burns.is_empty() {
+        info!("No scheduled daily realized-revenue burns found.");
         return Ok(());
     }
 
-    for decision in approved_decisions {
-        if decision.tokens_to_burn <= 0.0 {
-            mark_burn_decision_failed(state, decision.id, "No tokens to burn").await?;
+    for burn in scheduled_burns {
+        if burn.burn_amount_pex <= 0.0 || burn.eligible_revenue_amount_pex <= 0.0 {
+            info!(
+                burn_id = %burn.id,
+                "Skipping scheduled burn with zero eligible revenue or zero burn amount."
+            );
             continue;
         }
 
-        info!(
-            decision_id = %decision.id,
-            tokens_to_burn = %decision.tokens_to_burn,
-            burn_rate_percent = %format!("{:.2}%", decision.burn_rate_percent),
-            revenue_account = %state.config.trading_company_second_wallet,
-            "Approved Pera-X burn decision ready for on-chain execution"
-        );
-
-        let tx_signature = "PENDING_REAL_SOLANA_BURN_EXECUTION";
-
-        mark_burn_decision_executed(state, decision.id, tx_signature).await?;
+        let params = ContractBurnParamsPreview::from_scheduled_burn(&burn);
 
         info!(
-            decision_id = %decision.id,
-            signature = %tx_signature,
-            burned_amount = %decision.tokens_to_burn,
-            burn_rate_percent = %format!("{:.2}%", decision.burn_rate_percent),
-            "Approved daily burn marked for real execution integration"
+            burn_id = %burn.id,
+            decision_id_hex = %burn.decision_id_hex.as_deref().unwrap_or("missing"),
+            amount_minor_units = %params.amount,
+            eligible_revenue_minor_units = %params.eligible_revenue_amount,
+            burn_rate_bps = %params.burn_rate_bps,
+            market_health_score = %params.market_health_score,
+            observed_at = %params.observed_at,
+            burn_execution_mode = %state.config.burn_execution_mode.as_str(),
+            "Daily burn is ready for system/oracle smart-contract execution. Admin is view-only."
         );
+
+        mark_burn_ready_for_contract_execution(state, burn.id).await?;
     }
 
     Ok(())
 }
 
 #[derive(Debug, sqlx::FromRow)]
-struct ApprovedBurnDecision {
+struct ScheduledDailyBurn {
     id: Uuid,
-    tokens_to_burn: f64,
-    burn_rate_percent: f64,
+    decision_id_hex: Option<String>,
+    eligible_revenue_amount_pex: f64,
+    burn_amount_pex: f64,
+    burn_rate_bps: i32,
+    market_health_score: i32,
+    observed_at_unix: Option<i64>,
 }
 
-async fn persist_burn_decision(
-    state: &AppState,
-    decision: &DailyBurnDecision,
-    trading_company_balance: f64,
-    tokens_to_burn: f64,
-    status: &str,
-    tx_signature: Option<&str>,
-) -> Result<Uuid, GatewayError> {
-    let decision_id = sqlx::query_scalar::<_, Uuid>(
-        r#"
-        insert into daily_burn_decisions (
-            burn_rate,
-            burn_rate_percent,
-            market_health_score,
-            liquidity_score,
-            utility_usage_score,
-            holder_pressure_score,
-            trading_company_wallet_score,
-            trading_company_balance,
-            tokens_to_burn,
-            reason,
-            tx_signature,
-            status
-        ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-        returning id
-        "#,
-    )
-    .bind(decision.burn_rate)
-    .bind(decision.burn_rate_percent)
-    .bind(decision.market_health_score)
-    .bind(decision.liquidity_score)
-    .bind(decision.utility_usage_score)
-    .bind(decision.holder_pressure_score)
-    .bind(decision.trading_company_wallet_score)
-    .bind(trading_company_balance)
-    .bind(tokens_to_burn)
-    .bind(&decision.reason)
-    .bind(tx_signature)
-    .bind(status)
-    .fetch_one(&state.db)
-    .await?;
-
-    Ok(decision_id)
+#[derive(Debug)]
+struct ContractBurnParamsPreview {
+    amount: u64,
+    eligible_revenue_amount: u64,
+    burn_rate_bps: u16,
+    market_health_score: u8,
+    observed_at: i64,
 }
 
-async fn mark_burn_decision_executed(
-    state: &AppState,
-    decision_id: Uuid,
-    tx_signature: &str,
-) -> Result<(), GatewayError> {
-    sqlx::query(
-        r#"
-        update daily_burn_decisions
-        set status = 'executed', tx_signature = $1, updated_at = now()
-        where id = $2 and status = 'approved'
-        "#,
-    )
-    .bind(tx_signature)
-    .bind(decision_id)
-    .execute(&state.db)
-    .await?;
-
-    Ok(())
-}
-
-async fn mark_burn_decision_failed(
-    state: &AppState,
-    decision_id: Uuid,
-    reason: &str,
-) -> Result<(), GatewayError> {
-    sqlx::query(
-        r#"
-        update daily_burn_decisions
-        set status = 'failed', reason = concat(reason, ' | Failure: ', $1), updated_at = now()
-        where id = $2 and status = 'approved'
-        "#,
-    )
-    .bind(reason)
-    .bind(decision_id)
-    .execute(&state.db)
-    .await?;
-
-    Ok(())
-}
-
-async fn fetch_trading_company_revenue_balance(state: &AppState) -> Result<f64, GatewayError> {
-    let balance_payload = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getTokenAccountBalance",
-        "params": [state.config.trading_company_second_wallet]
-    });
-
-    let response = state
-        .http
-        .post(&state.solana_rpc.rpc_url)
-        .json(&balance_payload)
-        .send()
-        .await?;
-
-    let resp_data: serde_json::Value = response.json().await?;
-    Ok(resp_data["result"]["value"]["uiAmount"]
-        .as_f64()
-        .unwrap_or(0.0))
-}
-
-fn build_market_policy_input(trading_company_balance: f64) -> MarketPolicyInput {
-    let trading_company_wallet_score = if trading_company_balance >= 1_000_000.0 {
-        1.0
-    } else if trading_company_balance >= 100_000.0 {
-        0.7
-    } else if trading_company_balance >= 10_000.0 {
-        0.4
-    } else {
-        0.2
-    };
-
-    MarketPolicyInput {
-        market_health_score: 0.70,
-        liquidity_score: 0.60,
-        utility_usage_score: 0.50,
-        holder_pressure_score: 0.50,
-        trading_company_wallet_score,
+impl ContractBurnParamsPreview {
+    fn from_scheduled_burn(burn: &ScheduledDailyBurn) -> Self {
+        Self {
+            amount: pex_to_minor_units(burn.burn_amount_pex),
+            eligible_revenue_amount: pex_to_minor_units(burn.eligible_revenue_amount_pex),
+            burn_rate_bps: burn.burn_rate_bps.clamp(0, 10_000) as u16,
+            market_health_score: burn.market_health_score.clamp(0, 100) as u8,
+            observed_at: burn.observed_at_unix.unwrap_or_default(),
+        }
     }
+}
+
+async fn mark_burn_ready_for_contract_execution(
+    state: &AppState,
+    burn_id: Uuid,
+) -> Result<(), GatewayError> {
+    sqlx::query(
+        r#"
+        update pex_daily_realized_burns
+        set burn_status = 'scheduled', updated_at = now()
+        where id = $1 and burn_status = 'scheduled'
+        "#,
+    )
+    .bind(burn_id)
+    .execute(&state.db)
+    .await?;
+
+    Ok(())
+}
+
+fn pex_to_minor_units(amount_pex: f64) -> u64 {
+    if !amount_pex.is_finite() || amount_pex <= 0.0 {
+        return 0;
+    }
+
+    (amount_pex * 1_000_000.0).round().clamp(0.0, u64::MAX as f64) as u64
 }
