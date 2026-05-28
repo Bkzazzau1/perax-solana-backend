@@ -15,9 +15,9 @@ use crate::{
 pub fn spawn_daily_burner(state: AppState) {
     tokio::spawn(async move {
         info!(
-            treasury = %state.trading_co_wallet.treasury_address,
+            revenue_account = %state.config.trading_company_second_wallet,
             burn_execution_mode = %state.config.burn_execution_mode.as_str(),
-            "Starting PEX daily burn decision worker"
+            "Starting PEX daily burn decision worker from revenue account"
         );
 
         loop {
@@ -44,10 +44,10 @@ pub fn spawn_daily_burner(state: AppState) {
 }
 
 async fn declare_daily_revenue_burn(state: &AppState) -> Result<(), GatewayError> {
-    let trading_company_balance = fetch_trading_company_token_balance(state).await?;
+    let trading_company_balance = fetch_trading_company_revenue_balance(state).await?;
 
     if trading_company_balance <= 0.0 {
-        info!("No service tokens found in trading treasury. Skipping burn declaration.");
+        info!("No PEX found in Trading Company revenue account. Skipping burn declaration.");
         return Ok(());
     }
 
@@ -76,7 +76,7 @@ async fn declare_daily_revenue_burn(state: &AppState) -> Result<(), GatewayError
         trading_company_wallet_score = %decision.trading_company_wallet_score,
         tokens_to_burn = %tokens_to_burn,
         burn_execution_mode = %state.config.burn_execution_mode.as_str(),
-        "Daily Pera-X burn policy decision declared and saved. Awaiting approval before execution."
+        "Daily Pera-X burn policy decision declared from revenue account. Awaiting execution policy."
     );
 
     Ok(())
@@ -113,10 +113,11 @@ async fn execute_approved_burn_decisions(state: &AppState) -> Result<(), Gateway
             decision_id = %decision.id,
             tokens_to_burn = %decision.tokens_to_burn,
             burn_rate_percent = %format!("{:.2}%", decision.burn_rate_percent),
-            "Executing approved Pera-X burn decision"
+            revenue_account = %state.config.trading_company_second_wallet,
+            "Approved Pera-X burn decision ready for on-chain execution"
         );
 
-        let tx_signature = "MOCK_SOLANA_BURN_SIGNATURE_HASH";
+        let tx_signature = "PENDING_REAL_SOLANA_BURN_EXECUTION";
 
         mark_burn_decision_executed(state, decision.id, tx_signature).await?;
 
@@ -125,7 +126,7 @@ async fn execute_approved_burn_decisions(state: &AppState) -> Result<(), Gateway
             signature = %tx_signature,
             burned_amount = %decision.tokens_to_burn,
             burn_rate_percent = %format!("{:.2}%", decision.burn_rate_percent),
-            "Approved daily burn finalized and persisted"
+            "Approved daily burn marked for real execution integration"
         );
     }
 
@@ -224,12 +225,12 @@ async fn mark_burn_decision_failed(
     Ok(())
 }
 
-async fn fetch_trading_company_token_balance(state: &AppState) -> Result<f64, GatewayError> {
+async fn fetch_trading_company_revenue_balance(state: &AppState) -> Result<f64, GatewayError> {
     let balance_payload = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getTokenAccountBalance",
-        "params": [state.config.trading_co_treasury]
+        "params": [state.config.trading_company_second_wallet]
     });
 
     let response = state
