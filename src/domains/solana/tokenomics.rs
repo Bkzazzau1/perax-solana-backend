@@ -33,6 +33,8 @@ pub struct UnlockPolicy {
     pub max_daily_unlock_percentage_of_total_supply: f64,
     pub max_daily_unlock_amount: u64,
     pub requires_manual_or_multisig_approval: bool,
+    pub release_authority: &'static str,
+    pub safety_authority: &'static str,
     pub emergency_pause_enabled: bool,
 }
 
@@ -67,7 +69,9 @@ pub const UNLOCK_POLICY: UnlockPolicy = UnlockPolicy {
     cooldown_hours_max: 6,
     max_daily_unlock_percentage_of_total_supply: 1.0,
     max_daily_unlock_amount: 10_000_000,
-    requires_manual_or_multisig_approval: true,
+    requires_manual_or_multisig_approval: false,
+    release_authority: "market_condition_oracle_only",
+    safety_authority: "emergency_pause_and_system_maintenance_only",
     emergency_pause_enabled: true,
 };
 
@@ -81,9 +85,9 @@ pub fn evaluate_unlock_review(current_price_usd: f64) -> UnlockReview {
     let stage = current_stage_for_price(current_price_usd);
     let should_review = current_price_usd >= stage.trigger_price_usd;
     let message = if should_review {
-        format!("PEX price reached stage {} trigger on {}. Unlock review required; execution still needs TWAP, liquidity, volume, cooldown, daily cap, purpose, and manual approval.", stage.stage, PEX_TOKENOMICS.liquidity_venue)
+        format!("PEX price reached stage {} trigger on {}. Oracle-controlled release approval can be recorded only after TWAP, liquidity, volume, cooldown, daily cap, monthly cap, and business-purpose gates are satisfied.", stage.stage, PEX_TOKENOMICS.liquidity_venue)
     } else {
-        format!("PEX price remains below stage {} trigger. No unlock review required.", stage.stage)
+        format!("PEX price remains below stage {} trigger. No oracle release approval required.", stage.stage)
     };
 
     UnlockReview { should_review, stage, current_price_usd, message }
