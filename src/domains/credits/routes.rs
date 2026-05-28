@@ -3,7 +3,12 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    domains::solana::revenue_ledger::{RecordPexRevenueInput, record_pex_revenue_event},
+    domains::{
+        credits::pricing_engine::{
+            BuildCreditQuoteInput, CreditFundingMethod, CreditQuote, build_credit_quote,
+        },
+        solana::revenue_ledger::{RecordPexRevenueInput, record_pex_revenue_event},
+    },
     error::{GatewayError, GatewayResult},
     state::AppState,
 };
@@ -17,35 +22,8 @@ pub struct BuyCreditsRequest {
     pub reference_hex: Option<String>,
     pub payer_wallet: Option<String>,
     pub token_mint: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, Copy)]
-#[serde(rename_all = "snake_case")]
-pub enum CreditFundingMethod {
-    Pex,
-    Card,
-    Stablecoin,
-    VirtualAccount,
-}
-
-impl CreditFundingMethod {
-    fn asset_code(self) -> &'static str {
-        match self {
-            Self::Pex => "PEX",
-            Self::Card => "FIAT_USD",
-            Self::Stablecoin => "USDT",
-            Self::VirtualAccount => "FIAT_USD",
-        }
-    }
-}
-
-#[derive(Debug, Serialize, sqlx::FromRow)]
-#[serde(rename_all = "camelCase")]
-struct CreditExchangeRateRecord {
-    asset_code: String,
-    asset_name: String,
-    credits_per_unit: f64,
-    unit_label: String,
+    pub promo_code: Option<String>,
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,12 +44,19 @@ pub struct PexRevenueLedgerSummary {
 pub struct BuyCreditsResponse {
     pub accepted: bool,
     pub method: CreditFundingMethod,
-    pub credit_amount: f64,
+    pub requested_credits: f64,
+    pub final_credits: f64,
+    pub discount_percentage: f64,
+    pub promo_code: Option<String>,
     pub asset_code: String,
     pub asset_required: f64,
     pub pex_required: f64,
+    pub fiat_required: f64,
+    pub usd_value: f64,
+    pub burn_percentage: f64,
+    pub burn_usd_value: f64,
     pub remaining_pex: Option<f64>,
-    pub credits_per_unit: f64,
+    pub quote: CreditQuote,
     pub status: String,
     pub message: String,
     pub pex_revenue_ledger: Option<PexRevenueLedgerSummary>,
@@ -85,25 +70,19 @@ async fn buy_credits(
     State(state): State<AppState>,
     Json(payload): Json<BuyCreditsRequest>,
 ) -> GatewayResult<Json<BuyCreditsResponse>> {
-    let credit_amount = payload.credit_amount.max(0.0);
-    let asset_code = payload.method.asset_code();
-    let rate = get_credit_exchange_rate(&state, asset_code).await?;
-    let credits_per_unit = rate.credits_per_unit;
+    let quote = build_credit_quote(
+        &state,
+        BuildCreditQuoteInput {
+            funding_method: payload.method,
+            requested_credits: payload.credit_amount,
+            promo_code: payload.promo_code.clone(),
+            idempotency_key: payload.idempotency_key.clone(),
+        },
+    )
+    .await?;
 
-    if credits_per_unit <= 0.0 {
-        return Err(GatewayError::Upstream(format!(
-            "Invalid Credit exchange rate configured for {asset_code}"
-        )));
-    }
-
-    let asset_required = credit_amount / credits_per_unit;
-    let pex_required = if matches!(payload.method, CreditFundingMethod::Pex) {
-        asset_required
-    } else {
-        0.0
-    };
-    let remaining_pex = payload.pex_balance.map(|balance| balance - pex_required);
-    let accepted = credit_amount > 0.0 && remaining_pex.map(|value| value >= 0.0).unwrap_or(true);
+    let remaining_pex = payload.pex_balance.map(|balance| balance - quote.pex_required);
+    let accepted = quote.final_credits > 0.0 && remaining_pex.map(|value| value >= 0.0).unwrap_or(true);
 
     let mut pex_revenue_ledger = None;
     let mut status = if accepted {
@@ -113,8 +92,8 @@ async fn buy_credits(
     };
     let mut message = if accepted {
         format!(
-            "Credit purchase accepted using backend rate: {} Credits per {}.",
-            credits_per_unit, rate.unit_label
+            "Credit purchase quoted using stable policy: 1 USD = {} Credits. Supplier settlement remains fiat/stablecoin based.",
+            stable_credits_per_usd(&quote)
         )
     } else {
         "Credit purchase rejected. Check amount or available PEX balance.".to_string()
@@ -133,17 +112,27 @@ async fn buy_credits(
                 reference_hex,
                 payer_wallet: payload.payer_wallet.clone(),
                 token_mint: payload.token_mint.clone(),
-                pex_received: pex_required,
-                credits_granted: credit_amount,
+                pex_received: quote.pex_required,
+                credits_granted: quote.final_credits,
                 service_code: Some("credits_buy".to_string()),
-                raw_event: None,
+                raw_event: Some(serde_json::json!({
+                    "quoteReference": quote.quote_reference,
+                    "fundingMethod": quote.funding_method,
+                    "usdValue": quote.usd_value,
+                    "pexPriceUsd": quote.pex_price_usd,
+                    "discountPercentage": quote.discount_percentage,
+                    "promoCode": quote.promo_code,
+                    "idempotencyKey": payload.idempotency_key,
+                    "burnPercentage": quote.burn_percentage,
+                    "burnUsdValue": quote.burn_usd_value
+                })),
             },
         )
         .await?;
 
         status = "credited_and_burn_declared".to_string();
         message = format!(
-            "Credits granted. PEX revenue recorded; {}% immediate burn declared and remaining PEX assigned to Trading Company second wallet.",
+            "Credits granted from PEX using current PEX/USD policy. PEX revenue recorded; {}% immediate burn declared and remaining PEX assigned to Trading Company revenue account.",
             record.immediate_burn_percentage
         );
 
@@ -159,42 +148,45 @@ async fn buy_credits(
         });
     }
 
+    if accepted && !matches!(payload.method, CreditFundingMethod::Pex) {
+        status = "credited_pending_revenue_burn_allocation".to_string();
+        message = format!(
+            "Credits granted from {}. Fiat/stablecoin revenue burn allocation recorded by policy at {}% of USD value; supplier settlement remains fiat/stablecoin based.",
+            quote.asset_code,
+            quote.burn_percentage
+        );
+    }
+
     Ok(Json(BuyCreditsResponse {
         accepted,
         method: payload.method,
-        credit_amount,
-        asset_code: asset_code.to_string(),
-        asset_required,
-        pex_required,
+        requested_credits: quote.requested_credits,
+        final_credits: quote.final_credits,
+        discount_percentage: quote.discount_percentage,
+        promo_code: quote.promo_code.clone(),
+        asset_code: quote.asset_code.clone(),
+        asset_required: if matches!(payload.method, CreditFundingMethod::Pex) {
+            quote.pex_required
+        } else {
+            quote.fiat_required
+        },
+        pex_required: quote.pex_required,
+        fiat_required: quote.fiat_required,
+        usd_value: quote.usd_value,
+        burn_percentage: quote.burn_percentage,
+        burn_usd_value: quote.burn_usd_value,
         remaining_pex,
-        credits_per_unit,
+        quote,
         status,
         message,
         pex_revenue_ledger,
     }))
 }
 
-async fn get_credit_exchange_rate(
-    state: &AppState,
-    asset_code: &str,
-) -> GatewayResult<CreditExchangeRateRecord> {
-    sqlx::query_as::<_, CreditExchangeRateRecord>(
-        r#"
-        select asset_code,
-               asset_name,
-               credits_per_unit::double precision as credits_per_unit,
-               unit_label
-        from credit_exchange_rates
-        where asset_code = $1 and is_active = true
-        limit 1
-        "#,
-    )
-    .bind(asset_code)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| {
-        GatewayError::Upstream(format!(
-            "No active Credit exchange rate configured for {asset_code}"
-        ))
-    })
+fn stable_credits_per_usd(quote: &CreditQuote) -> f64 {
+    if quote.usd_value <= 0.0 {
+        0.0
+    } else {
+        (quote.final_credits / quote.usd_value * 100.0).round() / 100.0
+    }
 }
