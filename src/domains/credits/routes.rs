@@ -6,6 +6,7 @@ use crate::{
     domains::{
         credits::pricing_engine::{
             BuildCreditQuoteInput, CreditFundingMethod, CreditQuote, build_credit_quote,
+            get_credit_quote_by_reference, mark_credit_quote_accepted, mark_credit_quote_credited,
         },
         solana::revenue_ledger::{RecordPexRevenueInput, record_pex_revenue_event},
     },
@@ -34,6 +35,7 @@ pub struct QuoteCreditsResponse {
 pub struct BuyCreditsRequest {
     pub method: CreditFundingMethod,
     pub credit_amount: f64,
+    pub quote_reference: Option<String>,
     pub pex_balance: Option<f64>,
     pub reference_hex: Option<String>,
     pub payer_wallet: Option<String>,
@@ -109,16 +111,35 @@ async fn buy_credits(
     State(state): State<AppState>,
     Json(payload): Json<BuyCreditsRequest>,
 ) -> GatewayResult<Json<BuyCreditsResponse>> {
-    let quote = build_credit_quote(
-        &state,
-        BuildCreditQuoteInput {
-            funding_method: payload.method,
-            requested_credits: payload.credit_amount,
-            promo_code: payload.promo_code.clone(),
-            idempotency_key: payload.idempotency_key.clone(),
-        },
-    )
-    .await?;
+    let quote = match payload.quote_reference.as_deref() {
+        Some(reference) if !reference.trim().is_empty() => {
+            get_credit_quote_by_reference(&state, reference).await?
+        }
+        _ => {
+            build_credit_quote(
+                &state,
+                BuildCreditQuoteInput {
+                    funding_method: payload.method,
+                    requested_credits: payload.credit_amount,
+                    promo_code: payload.promo_code.clone(),
+                    idempotency_key: payload.idempotency_key.clone(),
+                },
+            )
+            .await?
+        }
+    };
+
+    if quote.funding_method != payload.method {
+        return Err(GatewayError::Upstream(
+            "quote funding method does not match purchase funding method".to_string(),
+        ));
+    }
+
+    if quote.status != "quoted" {
+        return Err(GatewayError::Upstream(
+            "quote has already been accepted, credited, cancelled, or expired".to_string(),
+        ));
+    }
 
     let remaining_pex = payload.pex_balance.map(|balance| balance - quote.pex_required);
     let accepted = quote.final_credits > 0.0 && remaining_pex.map(|value| value >= 0.0).unwrap_or(true);
@@ -131,12 +152,16 @@ async fn buy_credits(
     };
     let mut message = if accepted {
         format!(
-            "Credit purchase quoted using stable policy: 1 USD = {} Credits. Supplier settlement remains fiat/stablecoin based.",
-            stable_credits_per_usd(&quote)
+            "Credit purchase uses stored quote {}. Supplier settlement remains fiat/stablecoin based.",
+            quote.quote_reference
         )
     } else {
         "Credit purchase rejected. Check amount or available PEX balance.".to_string()
     };
+
+    if accepted {
+        mark_credit_quote_accepted(&state, &quote.quote_reference).await?;
+    }
 
     if accepted && matches!(payload.method, CreditFundingMethod::Pex) {
         let reference_hex = payload.reference_hex.clone().ok_or_else(|| {
@@ -169,9 +194,12 @@ async fn buy_credits(
         )
         .await?;
 
+        mark_credit_quote_credited(&state, &quote.quote_reference).await?;
+
         status = "credited_and_burn_declared".to_string();
         message = format!(
-            "Credits granted from PEX using current PEX/USD policy. PEX revenue recorded; {}% immediate burn declared and remaining PEX assigned to Trading Company revenue account.",
+            "Credits granted from stored quote {}. PEX revenue recorded; {}% immediate burn declared and remaining PEX assigned to Trading Company revenue account.",
+            quote.quote_reference,
             record.immediate_burn_percentage
         );
 
@@ -188,9 +216,11 @@ async fn buy_credits(
     }
 
     if accepted && !matches!(payload.method, CreditFundingMethod::Pex) {
+        mark_credit_quote_credited(&state, &quote.quote_reference).await?;
         status = "credited_pending_revenue_burn_allocation".to_string();
         message = format!(
-            "Credits granted from {}. Fiat/stablecoin revenue burn allocation recorded by policy at {}% of USD value; supplier settlement remains fiat/stablecoin based.",
+            "Credits granted from stored quote {} using {}. Fiat/stablecoin revenue burn allocation recorded by policy at {}% of USD value; supplier settlement remains fiat/stablecoin based.",
+            quote.quote_reference,
             quote.asset_code,
             quote.burn_percentage
         );
@@ -220,14 +250,6 @@ async fn buy_credits(
         message,
         pex_revenue_ledger,
     }))
-}
-
-fn stable_credits_per_usd(quote: &CreditQuote) -> f64 {
-    if quote.usd_value <= 0.0 {
-        0.0
-    } else {
-        (quote.final_credits / quote.usd_value * 100.0).round() / 100.0
-    }
 }
 
 fn format_quote_message(quote: &CreditQuote) -> String {
