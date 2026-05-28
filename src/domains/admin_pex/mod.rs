@@ -1,4 +1,4 @@
-use axum::{Json, Router, extract::{Path, Query, State}, routing::{get, post}};
+use axum::{Json, Router, extract::{Query, State}, routing::{get, post}};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -10,8 +10,6 @@ pub fn router() -> Router<AppState> {
         .route("/admin/api/pex/revenue-events", get(list_pex_revenue_events))
         .route("/admin/api/pex/monthly-sell-cap", get(list_monthly_sell_cap))
         .route("/admin/api/pex/daily-burns", get(list_daily_realized_burns))
-        .route("/admin/api/pex/daily-burns/{id}/approve", post(approve_daily_realized_burn))
-        .route("/admin/api/pex/daily-burns/{id}/cancel", post(cancel_daily_realized_burn))
         .route("/admin/api/pex/sell-events", get(list_revenue_token_account_sell_events))
         .route("/admin/api/pex/sell-events/declare", post(declare_revenue_token_account_sale))
 }
@@ -186,13 +184,6 @@ struct DailyRealizedBurnRecord {
 struct DailyRealizedBurnsResponse {
     count: usize,
     burns: Vec<DailyRealizedBurnRecord>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DailyBurnActionResponse {
-    accepted: bool,
-    burn: DailyRealizedBurnRecord,
     message: String,
 }
 
@@ -236,86 +227,7 @@ async fn list_daily_realized_burns(
     Ok(Json(DailyRealizedBurnsResponse {
         count: burns.len(),
         burns,
-    }))
-}
-
-async fn approve_daily_realized_burn(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> GatewayResult<Json<DailyBurnActionResponse>> {
-    let burn = sqlx::query_as::<_, DailyRealizedBurnRecord>(
-        r#"
-        update pex_daily_realized_burns
-        set burn_status = 'approved', updated_at = now()
-        where id = $1 and burn_status = 'scheduled'
-        returning
-            id,
-            revenue_day,
-            trading_company_revenue_account,
-            realized_revenue_pex::float8 as realized_revenue_pex,
-            eligible_revenue_amount_pex::float8 as eligible_revenue_amount_pex,
-            burn_percentage::float8 as burn_percentage,
-            burn_rate_bps,
-            market_health_score,
-            burn_amount_pex::float8 as burn_amount_pex,
-            remaining_revenue_pex::float8 as remaining_revenue_pex,
-            burn_status,
-            burn_tx_signature,
-            decision_id_hex,
-            observed_at,
-            onchain_burn_record,
-            last_revenue_event_id
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| GatewayError::Upstream("Daily burn was not found or is not scheduled.".to_string()))?;
-
-    Ok(Json(DailyBurnActionResponse {
-        accepted: true,
-        burn,
-        message: "Daily realized-revenue burn approved. It is now ready for later smart-contract execution.".to_string(),
-    }))
-}
-
-async fn cancel_daily_realized_burn(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> GatewayResult<Json<DailyBurnActionResponse>> {
-    let burn = sqlx::query_as::<_, DailyRealizedBurnRecord>(
-        r#"
-        update pex_daily_realized_burns
-        set burn_status = 'cancelled', updated_at = now()
-        where id = $1 and burn_status in ('scheduled', 'approved')
-        returning
-            id,
-            revenue_day,
-            trading_company_revenue_account,
-            realized_revenue_pex::float8 as realized_revenue_pex,
-            eligible_revenue_amount_pex::float8 as eligible_revenue_amount_pex,
-            burn_percentage::float8 as burn_percentage,
-            burn_rate_bps,
-            market_health_score,
-            burn_amount_pex::float8 as burn_amount_pex,
-            remaining_revenue_pex::float8 as remaining_revenue_pex,
-            burn_status,
-            burn_tx_signature,
-            decision_id_hex,
-            observed_at,
-            onchain_burn_record,
-            last_revenue_event_id
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| GatewayError::Upstream("Daily burn was not found or cannot be cancelled.".to_string()))?;
-
-    Ok(Json(DailyBurnActionResponse {
-        accepted: true,
-        burn,
-        message: "Daily realized-revenue burn cancelled. It will not be executed unless rescheduled.".to_string(),
+        message: "Daily burn is view-only for admin. Burn rate and execution are controlled by market-condition backend/oracle logic, not manual admin approval or cancellation.".to_string(),
     }))
 }
 
