@@ -192,7 +192,7 @@ async fn list_daily_realized_burns(
     Query(query): Query<DailyBurnQuery>,
 ) -> GatewayResult<Json<DailyRealizedBurnsResponse>> {
     let limit = query.limit.unwrap_or(30).clamp(1, 100);
-    let status = query.burn_status.and_then(clean_optional_text);
+    let status = clean_optional_text(query.burn_status);
 
     let burns = sqlx::query_as::<_, DailyRealizedBurnRecord>(
         r#"
