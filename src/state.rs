@@ -27,7 +27,10 @@ impl AppState {
         let db = db::connect(&config.database_url).await?;
         let cache = cache::connect(&config.redis_url).await?;
         let solana_rpc = Arc::new(TreasuryRpc::new(config.solana_rpc_url.clone()));
-        let trading_co_wallet = Arc::new(TradingWallet::new(config.trading_co_treasury.clone()));
+        let trading_co_wallet = Arc::new(TradingWallet::new(
+    config.trading_co_treasury.clone(),
+    config.trading_company_second_wallet.clone(),
+));
         let http = reqwest::Client::new();
 
         Ok(Self {
