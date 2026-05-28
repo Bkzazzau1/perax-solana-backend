@@ -53,6 +53,7 @@ pub async fn record_pex_revenue_event(
     let pex_burn_amount = round_token_amount(pex_received * (burn_percentage / 100.0));
     let pex_remaining_amount = round_token_amount(pex_received - pex_burn_amount);
     let revenue_month = current_revenue_month();
+    let revenue_day = current_revenue_day();
 
     let trading_company_locked_token_account = &state.config.trading_co_treasury;
     let trading_company_revenue_token_account = &state.config.trading_company_second_wallet;
@@ -74,9 +75,11 @@ pub async fn record_pex_revenue_event(
             pex_remaining_amount,
             burn_status,
             revenue_month,
+            revenue_day,
+            realized_after_credit,
             service_code,
             raw_event
-        ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'declared', $11, $12, $13)
+        ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'declared', $11, $12, true, $13, $14)
         on conflict (reference_hex) do update
         set
             pex_received = excluded.pex_received,
@@ -85,6 +88,8 @@ pub async fn record_pex_revenue_event(
             pex_burn_amount = excluded.pex_burn_amount,
             pex_remaining_amount = excluded.pex_remaining_amount,
             trading_company_second_wallet = excluded.trading_company_second_wallet,
+            revenue_day = excluded.revenue_day,
+            realized_after_credit = true,
             burn_status = case
                 when pex_revenue_events.burn_status in ('approved', 'executed') then pex_revenue_events.burn_status
                 else excluded.burn_status
@@ -115,6 +120,7 @@ pub async fn record_pex_revenue_event(
     .bind(pex_burn_amount)
     .bind(pex_remaining_amount)
     .bind(revenue_month)
+    .bind(revenue_day)
     .bind(input.service_code)
     .bind(input.raw_event)
     .fetch_one(&mut *tx)
@@ -128,6 +134,16 @@ pub async fn record_pex_revenue_event(
         pex_burn_amount,
         pex_remaining_amount,
         state.config.pex_monthly_sell_cap_percentage,
+    )
+    .await?;
+
+    upsert_daily_realized_burn_schedule(
+        &mut tx,
+        revenue_day,
+        trading_company_revenue_token_account,
+        pex_received,
+        burn_percentage,
+        record.id,
     )
     .await?;
 
@@ -212,9 +228,64 @@ async fn upsert_monthly_sell_cap_ledger(
     Ok(())
 }
 
+async fn upsert_daily_realized_burn_schedule(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    revenue_day: NaiveDate,
+    revenue_token_account: &str,
+    realized_revenue_pex: f64,
+    burn_percentage: f64,
+    last_revenue_event_id: Uuid,
+) -> GatewayResult<()> {
+    let burn_amount = round_token_amount(realized_revenue_pex * (burn_percentage / 100.0));
+    let remaining_amount = round_token_amount(realized_revenue_pex - burn_amount);
+
+    sqlx::query(
+        r#"
+        insert into pex_daily_realized_burns (
+            revenue_day,
+            trading_company_revenue_account,
+            realized_revenue_pex,
+            burn_percentage,
+            burn_amount_pex,
+            remaining_revenue_pex,
+            burn_status,
+            last_revenue_event_id
+        ) values ($1, $2, $3, $4, $5, $6, 'scheduled', $7)
+        on conflict (revenue_day) do update
+        set
+            trading_company_revenue_account = excluded.trading_company_revenue_account,
+            realized_revenue_pex = pex_daily_realized_burns.realized_revenue_pex + excluded.realized_revenue_pex,
+            burn_percentage = excluded.burn_percentage,
+            burn_amount_pex = round(((pex_daily_realized_burns.realized_revenue_pex + excluded.realized_revenue_pex) * excluded.burn_percentage / 100)::numeric, 6),
+            remaining_revenue_pex = round(((pex_daily_realized_burns.realized_revenue_pex + excluded.realized_revenue_pex) - ((pex_daily_realized_burns.realized_revenue_pex + excluded.realized_revenue_pex) * excluded.burn_percentage / 100))::numeric, 6),
+            burn_status = case
+                when pex_daily_realized_burns.burn_status in ('executed', 'cancelled') then pex_daily_realized_burns.burn_status
+                else 'scheduled'
+            end,
+            last_revenue_event_id = excluded.last_revenue_event_id,
+            updated_at = now()
+        "#,
+    )
+    .bind(revenue_day)
+    .bind(revenue_token_account)
+    .bind(realized_revenue_pex)
+    .bind(burn_percentage)
+    .bind(burn_amount)
+    .bind(remaining_amount)
+    .bind(last_revenue_event_id)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
 fn current_revenue_month() -> NaiveDate {
     let now = Utc::now().date_naive();
     NaiveDate::from_ymd_opt(now.year(), now.month(), 1).expect("valid first day of month")
+}
+
+fn current_revenue_day() -> NaiveDate {
+    Utc::now().date_naive()
 }
 
 fn normalize_reference_hex(reference_hex: &str) -> String {
