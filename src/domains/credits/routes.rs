@@ -15,6 +15,22 @@ use crate::{
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct QuoteCreditsRequest {
+    pub method: CreditFundingMethod,
+    pub credit_amount: f64,
+    pub promo_code: Option<String>,
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuoteCreditsResponse {
+    pub quote: CreditQuote,
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BuyCreditsRequest {
     pub method: CreditFundingMethod,
     pub credit_amount: f64,
@@ -63,7 +79,30 @@ pub struct BuyCreditsResponse {
 }
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/credits/buy", post(buy_credits))
+    Router::new()
+        .route("/credits/quote", post(quote_credits))
+        .route("/credits/buy", post(buy_credits))
+}
+
+async fn quote_credits(
+    State(state): State<AppState>,
+    Json(payload): Json<QuoteCreditsRequest>,
+) -> GatewayResult<Json<QuoteCreditsResponse>> {
+    let quote = build_credit_quote(
+        &state,
+        BuildCreditQuoteInput {
+            funding_method: payload.method,
+            requested_credits: payload.credit_amount,
+            promo_code: payload.promo_code,
+            idempotency_key: payload.idempotency_key,
+        },
+    )
+    .await?;
+
+    Ok(Json(QuoteCreditsResponse {
+        message: format_quote_message(&quote),
+        quote,
+    }))
 }
 
 async fn buy_credits(
@@ -188,5 +227,32 @@ fn stable_credits_per_usd(quote: &CreditQuote) -> f64 {
         0.0
     } else {
         (quote.final_credits / quote.usd_value * 100.0).round() / 100.0
+    }
+}
+
+fn format_quote_message(quote: &CreditQuote) -> String {
+    match quote.funding_method {
+        CreditFundingMethod::Pex => format!(
+            "Admin policy price: {} Credits costs ${:.2}. User pays {:.6} PEX at PEX/USD price {:?}. Discount: {}%.",
+            quote.final_credits,
+            quote.usd_value,
+            quote.pex_required,
+            quote.pex_price_usd,
+            quote.discount_percentage
+        ),
+        CreditFundingMethod::Card | CreditFundingMethod::VirtualAccount => format!(
+            "Admin policy price: {} Credits costs ${:.2}. User pays ${:.2}. Discount: {}%.",
+            quote.final_credits,
+            quote.usd_value,
+            quote.fiat_required,
+            quote.discount_percentage
+        ),
+        CreditFundingMethod::Stablecoin => format!(
+            "Admin policy price: {} Credits costs ${:.2}. User pays {:.2} USDC/stablecoin. Discount: {}%.",
+            quote.final_credits,
+            quote.usd_value,
+            quote.fiat_required,
+            quote.discount_percentage
+        ),
     }
 }
