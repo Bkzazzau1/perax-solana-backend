@@ -18,51 +18,54 @@ impl TreasuryRpc {
 
 #[derive(Debug, Clone)]
 pub struct TradingWallet {
-    pub treasury_address: String,
+    pub locked_account: String,
+    pub revenue_account: String,
 }
 
 impl TradingWallet {
-    pub fn new(treasury_address: String) -> Self {
-        Self { treasury_address }
+    pub fn new(locked_account: String, revenue_account: String) -> Self {
+        Self {
+            locked_account,
+            revenue_account,
+        }
     }
 }
 
 pub fn spawn_treasury_listener(state: AppState) {
     tokio::spawn(async move {
         info!(
-            treasury = %state.config.trading_co_treasury,
+            locked_account = %state.config.trading_co_treasury,
+            revenue_account = %state.config.trading_company_second_wallet,
             rpc = %state.solana_rpc.rpc_url,
             ws = %state.config.solana_ws_url,
-            "starting production solana treasury listener"
+            "starting Solana revenue account listener for PEX-for-Credits payments"
         );
 
-        // Keep track of the last scanned signature to avoid processing duplicate transfers
         let mut last_signature: Option<String> = None;
 
         loop {
-            // Safe network boundary isolation: wrap execution to prevent panics from crashing the background thread
-            if let Err(err) = poll_treasury_transfers(&state, &mut last_signature).await {
-                error!(error = %err, "Error encountered during solana treasury poll cycle");
+            if let Err(err) = poll_revenue_transfers(&state, &mut last_signature).await {
+                error!(error = %err, "Error encountered during Solana revenue poll cycle");
             }
 
-            // Short sleep interval optimized for high block velocity on Solana
             tokio::time::sleep(Duration::from_secs(10)).await;
         }
     });
 }
 
-/// Polls the Solana RPC for recent transaction signatures touching the Trading Company Wallet.
-async fn poll_treasury_transfers(
+/// Polls the Solana RPC for recent transaction signatures touching the Trading Company revenue token account.
+async fn poll_revenue_transfers(
     state: &AppState,
     last_sig: &mut Option<String>,
 ) -> Result<(), GatewayError> {
-    // 1. Send getSignaturesForAddress RPC payload to find recent transfers
+    let revenue_account = &state.config.trading_company_second_wallet;
+
     let payload = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getSignaturesForAddress",
         "params": [
-            state.config.trading_co_treasury,
+            revenue_account,
             { "limit": 5, "commitment": "confirmed" }
         ]
     });
@@ -83,31 +86,27 @@ async fn poll_treasury_transfers(
     let resp_data: serde_json::Value = response.json().await?;
     let signatures = match resp_data["result"].as_array() {
         Some(arr) => arr,
-        None => return Ok(()), // Quietly skip if no transactions exist yet
+        None => return Ok(()),
     };
 
     if signatures.is_empty() {
         return Ok(());
     }
 
-    // Capture the newest signature to track our checkpoint positioning
     let latest_fetched_sig = signatures[0]["signature"].as_str().map(|s| s.to_string());
 
-    // Iterate backwards through the transaction list to process older logs first
     for tx_info in signatures.iter().rev() {
         let sig_str = match tx_info["signature"].as_str() {
             Some(s) => s,
             None => continue,
         };
 
-        // Skip anything we already analyzed in a previous loop sequence
         if Some(sig_str.to_string()) == *last_sig {
             continue;
         }
 
-        debug!(signature = %sig_str, "Analyzing transaction signature for token settlement");
+        debug!(signature = %sig_str, revenue_account = %revenue_account, "Analyzing transaction signature for PEX revenue settlement");
 
-        // 2. Fetch full transaction details using standard JSON-RPC mapping
         let tx_payload = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -131,33 +130,27 @@ async fn poll_treasury_transfers(
 
         let tx_data: serde_json::Value = tx_resp.json().await?;
 
-        // 3. Extract SPL-Token transfers matching your Pera-X setup
-        // This parses standard Solana jsonParsed token balances to locate credit events
         if let Some(meta) = tx_data["result"]["meta"].as_object() {
             if let (Some(pre), Some(post)) =
                 (meta.get("preTokenBalances"), meta.get("postTokenBalances"))
             {
                 if let Some((amount_transferred, account_owner)) =
-                    extract_token_deltas(pre, post, &state.config.trading_co_treasury)
+                    extract_token_deltas(pre, post, revenue_account)
                 {
-                    info!(amount = %amount_transferred, owner = %account_owner, "Pera-X SPL-Token deposit detected! Processing settlement credits.");
+                    info!(amount = %amount_transferred, owner = %account_owner, revenue_account = %revenue_account, "PEX payment detected in revenue account. Processing Credits settlement.");
 
-                    // Convert your token units into the corresponding credit values
-                    // Users buy Pera-X, turn them into credits, and send tokens to the Trading Wallet [cite: 18, 24, 63]
-                    let credit_allocation = amount_transferred; // For 1:1 token-to-credit baseline ratios
+                    let credit_allocation = amount_transferred;
                     let user_redis_key = format!("client:balance:{}", account_owner);
 
-                    // Atomically credit the user's wallet wallet entry directly inside your Redis cache layer
                     cache::increment_credits(&state.cache, &user_redis_key, credit_allocation)
                         .await?;
 
-                    info!(user = %account_owner, credits = %credit_allocation, "User balance successfully topped up in memory cache.");
+                    info!(user = %account_owner, credits = %credit_allocation, "User Credits balance topped up after PEX payment.");
                 }
             }
         }
     }
 
-    // Update the pointer index location for the next polling block loop
     if latest_fetched_sig.is_some() {
         *last_sig = latest_fetched_sig;
     }
@@ -165,36 +158,44 @@ async fn poll_treasury_transfers(
     Ok(())
 }
 
-/// Utility function parsing pre/post token arrays to identify valid incoming Pera-X transfers.
+/// Utility function parsing pre/post token arrays to identify valid incoming PEX transfers.
 fn extract_token_deltas(
     pre_balances: &serde_json::Value,
     post_balances: &serde_json::Value,
-    treasury_addr: &str,
+    revenue_token_account: &str,
 ) -> Option<(f64, String)> {
-    let mut treasury_pre: f64 = 0.0;
-    let mut treasury_post: f64 = 0.0;
-    let mut sender_address: String = "default_dev".to_string();
+    let mut revenue_pre: f64 = 0.0;
+    let mut revenue_post: f64 = 0.0;
+    let mut sender_address: String = "unknown_sender".to_string();
 
-    // Trace treasury index changes
     if let Some(arr) = post_balances.as_array() {
         for balance in arr {
-            if balance["owner"].as_str() == Some(treasury_addr) {
-                treasury_post = balance["uiTokenAmount"]["uiAmount"].as_f64().unwrap_or(0.0);
+            if balance["accountIndex"].is_number()
+                && balance["uiTokenAmount"]["uiAmount"].is_number()
+                && balance["owner"].as_str().is_some()
+            {
+                if balance["owner"].as_str() == Some(revenue_token_account)
+                    || balance["account"].as_str() == Some(revenue_token_account)
+                {
+                    revenue_post = balance["uiTokenAmount"]["uiAmount"].as_f64().unwrap_or(0.0);
+                }
             }
         }
     }
 
     if let Some(arr) = pre_balances.as_array() {
         for balance in arr {
-            if balance["owner"].as_str() == Some(treasury_addr) {
-                treasury_pre = balance["uiTokenAmount"]["uiAmount"].as_f64().unwrap_or(0.0);
+            if balance["owner"].as_str() == Some(revenue_token_account)
+                || balance["account"].as_str() == Some(revenue_token_account)
+            {
+                revenue_pre = balance["uiTokenAmount"]["uiAmount"].as_f64().unwrap_or(0.0);
             } else if let Some(owner) = balance["owner"].as_str() {
-                sender_address = owner.to_string(); // Detect the sender to match credit distribution rows
+                sender_address = owner.to_string();
             }
         }
     }
 
-    let delta = treasury_post - treasury_pre;
+    let delta = revenue_post - revenue_pre;
     if delta > 0.0 {
         Some((delta, sender_address))
     } else {
