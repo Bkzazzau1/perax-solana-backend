@@ -3,12 +3,27 @@ name: Pera-X Backend Check
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [main]
+    paths:
+      - "src/**"
+      - "migrations/**"
+      - "scripts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/**"
   pull_request:
-    branches: [ main ]
+    branches: [main]
+    paths:
+      - "src/**"
+      - "migrations/**"
+      - "scripts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/**"
 
 jobs:
   check-backend:
+    name: Check, test, and smoke test backend
     runs-on: ubuntu-latest
 
     services:
@@ -21,34 +36,66 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+          --health-cmd="pg_isready -U postgres -d perax"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
 
       redis:
         image: redis:7
         ports:
           - 6379:6379
         options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
 
     env:
-      DATABASE_URL: postgres://postgres:postgres@localhost:5432/perax
+      HOST: 127.0.0.1
+      PORT: 8080
+
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/perax
       REDIS_URL: redis://127.0.0.1:6379
+
       SOLANA_RPC_URL: https://api.devnet.solana.com
       SOLANA_WS_URL: wss://api.devnet.solana.com
       PERAX_ANCHOR_WORKSPACE: /tmp/perax-contracts
-      PERAX_PROGRAM_ID: "11111111111111111111111111111111"
-      TRADING_CO_TREASURY: "replace-with-trading-company-token-account"
-      BURN_EXECUTION_MODE: manual
-      JWT_SECRET: "replace-with-at-least-32-characters-secret"
+
+      # Real Pera-X devnet deployment records
+      PERAX_PROGRAM_ID: FqEiSx5vujh2vi3yk12NaZMXhjMSaKovGUuzcKiAgshn
+      PERAX_STATE_PDA: 8LNUe8ud9Lrtt1HmuS132YoGs5tBNEeWeviNJwWDkHWT
+      PEX_MINT_ADDRESS: DnkAW3B1ckzW6eimgSBNPK3XTt83wMiZRETy8iF3gdsn
+
+      # Trading Company SPL token accounts
+      TRADING_COMPANY_TOKEN_ACCOUNT: Wcx1HaNWZQmtfn1yfS3FWXv7AKSXV8ftciezTX3ufs8
+      TRADING_COMPANY_REVENUE_TOKEN_ACCOUNT: E4JJoNkKhFq8Ev7XtJhuWrvdyNyWRzkwjsukgF9VbegA
+
+      # Backward-compatible config names
+      TRADING_CO_TREASURY: Wcx1HaNWZQmtfn1yfS3FWXv7AKSXV8ftciezTX3ufs8
+      TRADING_COMPANY_SECOND_WALLET: E4JJoNkKhFq8Ev7XtJhuWrvdyNyWRzkwjsukgF9VbegA
+
+      # PEX policy
+      PEX_IMMEDIATE_BURN_PERCENTAGE: "10"
+      PEX_MONTHLY_SELL_CAP_PERCENTAGE: "50"
+      PEX_UNLOCK_REQUIRES_MANUAL_APPROVAL: "false"
+
+      # CI must never execute real automatic burns
+      BURN_EXECUTION_MODE: disabled
+      PERAX_SUPPLY_CONTROL_EXECUTOR_URL: http://127.0.0.1:8787/execute/market-condition-burn
+      PERAX_SUPPLY_CONTROL_EXECUTOR_TOKEN: ci-only-disabled-token
+
+      # CI-only admin/test values
+      JWT_SECRET: ci-only-jwt-secret-please-never-use-in-prod-1234567890
+      ADMIN_USERNAME: admin
+      ADMIN_ACCESS_CODE: ci-only-admin-access-code
+
       CLAUDE_BASE_URL: https://api.anthropic.com
       COPYLEAKS_BASE_URL: https://api.copyleaks.com
       TELNYX_BASE_URL: https://api.telnyx.com
+
+      RUST_LOG: info
+      RUST_BACKTRACE: "1"
 
     steps:
       - name: Checkout repository
@@ -60,11 +107,35 @@ jobs:
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
 
-      - name: Normalize formatting
-        run: cargo fmt --all
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Wait for PostgreSQL
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for i in {1..30}; do
+            if pg_isready -h 127.0.0.1 -p 5432 -U postgres -d perax; then
+              echo "PostgreSQL is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "PostgreSQL did not become ready"
+          exit 1
+        env:
+          PGPASSWORD: postgres
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features rustls,postgres
 
       - name: Run migrations
-        run: cargo install sqlx-cli --no-default-features --features rustls,postgres && sqlx migrate run
+        run: sqlx migrate run
 
       - name: Run tests
         run: cargo test --all
@@ -73,15 +144,42 @@ jobs:
         run: cargo check --all-targets
 
       - name: Runtime smoke test
+        shell: bash
         run: |
+          set -euo pipefail
+
           cargo run > /tmp/perax-backend.log 2>&1 &
-          echo $! > /tmp/perax-backend.pid
-          for i in {1..30}; do
+          APP_PID=$!
+
+          cleanup() {
+            kill "$APP_PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          for i in {1..60}; do
             if curl -fsS http://127.0.0.1:8080/healthz; then
+              echo "Backend health check passed"
               break
             fi
+
+            if ! kill -0 "$APP_PID" 2>/dev/null; then
+              echo "Backend process exited before health check passed"
+              echo "== Backend log =="
+              cat /tmp/perax-backend.log || true
+              exit 1
+            fi
+
             sleep 2
           done
+
+          if ! curl -fsS http://127.0.0.1:8080/healthz; then
+            echo "Backend did not become healthy in time"
+            echo "== Backend log =="
+            cat /tmp/perax-backend.log || true
+            exit 1
+          fi
+
           chmod +x scripts/test-burn-admin.sh scripts/test-utility-payments.sh
+
           ./scripts/test-burn-admin.sh
           ./scripts/test-utility-payments.sh
