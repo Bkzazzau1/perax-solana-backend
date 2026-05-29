@@ -2,6 +2,7 @@
 -- Admin remains view-only. Burn execution is performed by backend/oracle executor.
 
 alter table pex_daily_realized_burns
+    add column if not exists burn_tx_signature text,
     add column if not exists onchain_tx_signature text,
     add column if not exists executed_at timestamptz,
     add column if not exists execution_error text;
