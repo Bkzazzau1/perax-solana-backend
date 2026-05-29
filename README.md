@@ -154,6 +154,7 @@ Set the required environment values:
 ```powershell
 $env:DATABASE_URL="postgres://postgres:postgres@localhost:5432/perax"
 $env:SOLANA_RPC_URL="https://api.devnet.solana.com"
+$env:PERAX_ANCHOR_WORKSPACE="C:/PROJECTS/Pera-X-ecosystem/perax-contracts"
 $env:PERAX_PROGRAM_ID="FqEiSx5vujh2vi3yk12NaZMXhjMSaKovGUuzcKiAgshn"
 $env:PERAX_STATE_PDA="8LNUe8ud9Lrtt1HmuS132YoGs5tBNEeWeviNJwWDkHWT"
 $env:PEX_MINT_ADDRESS="DnkAW3B1ckzW6eimgSBNPK3XTt83wMiZRETy8iF3gdsn"

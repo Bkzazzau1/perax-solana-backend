@@ -13,7 +13,7 @@ use crate::{config::Config, error::GatewayResult, state::AppState};
 
 #[tokio::main]
 async fn main() -> GatewayResult<()> {
-    dotenvy::dotenv().ok();
+    load_dotenv()?;
     init_tracing();
 
     let config = Config::from_env()?;
@@ -50,6 +50,18 @@ async fn main() -> GatewayResult<()> {
         listener.local_addr()?
     );
     axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+fn load_dotenv() -> GatewayResult<()> {
+    if let Err(err) = dotenvy::dotenv() {
+        if !err.not_found() {
+            return Err(crate::error::GatewayError::Config(format!(
+                "failed to load .env: {err}"
+            )));
+        }
+    }
 
     Ok(())
 }
