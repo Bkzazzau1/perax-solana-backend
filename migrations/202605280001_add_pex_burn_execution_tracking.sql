@@ -67,11 +67,20 @@ create table if not exists pex_daily_realized_burns (
     burn_status text not null default 'scheduled',
     last_revenue_event_id uuid,
     onchain_tx_signature text,
+    burn_tx_signature text,
+    onchain_burn_record text,
     executed_at timestamptz,
     execution_error text,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
+
+alter table if exists pex_daily_realized_burns
+    add column if not exists burn_tx_signature text,
+    add column if not exists onchain_burn_record text,
+    add column if not exists onchain_tx_signature text,
+    add column if not exists executed_at timestamptz,
+    add column if not exists execution_error text;
 
 create index if not exists idx_pex_daily_realized_burns_status
     on pex_daily_realized_burns (burn_status);
@@ -84,3 +93,9 @@ create index if not exists idx_pex_daily_realized_burns_decision_id
 
 create index if not exists idx_pex_daily_realized_burns_onchain_tx_signature
     on pex_daily_realized_burns (onchain_tx_signature);
+
+create index if not exists idx_pex_daily_realized_burns_burn_tx_signature
+    on pex_daily_realized_burns (burn_tx_signature);
+
+create index if not exists idx_pex_daily_realized_burns_onchain_burn_record
+    on pex_daily_realized_burns (onchain_burn_record);
