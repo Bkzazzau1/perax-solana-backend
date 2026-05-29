@@ -16,6 +16,8 @@ use crate::{
     state::AppState,
 };
 
+pub mod verification;
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
@@ -31,6 +33,7 @@ pub fn router() -> Router<AppState> {
             "/admin/api/utility-payments/grant",
             post(grant_utility_payment),
         )
+        .merge(verification::router())
 }
 
 #[derive(Debug, Serialize)]

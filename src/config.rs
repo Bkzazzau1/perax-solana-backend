@@ -5,12 +5,6 @@ use crate::error::{GatewayError, GatewayResult};
 pub const DEFAULT_PERAX_PROGRAM_ID: &str = "FqEiSx5vujh2vi3yk12NaZMXhjMSaKovGUuzcKiAgshn";
 pub const DEFAULT_PEX_MINT_ADDRESS: &str = "DnkAW3B1ckzW6eimgSBNPK3XTt83wMiZRETy8iF3gdsn";
 pub const DEFAULT_PERAX_STATE_PDA: &str = "8LNUe8ud9Lrtt1HmuS132YoGs5tBNEeWeviNJwWDkHWT";
-pub const DEFAULT_PEX_TOKEN_SYMBOL: &str = "PEX";
-pub const DEFAULT_PEX_DECIMALS: u8 = 6;
-pub const DEFAULT_PEX_TOTAL_SUPPLY: u64 = 1_000_000_000;
-pub const DEFAULT_PEX_INITIAL_PRICE_USD: f64 = 0.000012;
-pub const DEFAULT_PEX_INITIAL_LIQUIDITY_AMOUNT: u64 = 380_000_000;
-pub const DEFAULT_PEX_INITIAL_LIQUIDITY_QUOTE_USD: f64 = 4_560.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BurnExecutionMode {
@@ -61,8 +55,33 @@ pub struct Config {
     pub unlock_requires_manual_approval: bool,
     pub jwt_secret: String,
     pub claude_base_url: String,
+    pub anthropic_api_key: String,
+    pub claude_model: String,
     pub copyleaks_base_url: String,
+    pub copyleaks_email: String,
+    pub copyleaks_api_key: String,
+    pub copyleaks_webhook_secret: String,
     pub telnyx_base_url: String,
+    pub telnyx_api_key: String,
+    pub telnyx_messaging_profile_id: String,
+    pub telnyx_connection_id: String,
+    pub telnyx_from_number: String,
+    pub telnyx_webhook_public_key: String,
+    pub telnyx_webhook_signing_secret: String,
+    pub payscribe_base_url: String,
+    pub payscribe_api_key: String,
+    pub payscribe_secret_key: String,
+    pub payscribe_webhook_secret: String,
+    pub stripe_secret_key: String,
+    pub stripe_webhook_secret: String,
+    pub bank_rails_base_url: String,
+    pub bank_rails_api_key: String,
+    pub bank_rails_webhook_secret: String,
+    pub pyth_price_service_url: String,
+    pub pyth_pex_price_feed_id: String,
+    pub pyth_sol_price_feed_id: String,
+    pub meteora_api_base_url: String,
+    pub meteora_dlmm_pair_address: String,
 }
 
 impl Config {
@@ -92,14 +111,48 @@ impl Config {
                 "TRADING_COMPANY_REVENUE_TOKEN_ACCOUNT",
                 "TRADING_COMPANY_SECOND_WALLET",
             ])?,
-            pex_immediate_burn_percentage: parse_percentage_env("PEX_IMMEDIATE_BURN_PERCENTAGE", 10.0)?,
-            pex_monthly_sell_cap_percentage: parse_percentage_env("PEX_MONTHLY_SELL_CAP_PERCENTAGE", 50.0)?,
+            pex_immediate_burn_percentage: parse_percentage_env(
+                "PEX_IMMEDIATE_BURN_PERCENTAGE",
+                10.0,
+            )?,
+            pex_monthly_sell_cap_percentage: parse_percentage_env(
+                "PEX_MONTHLY_SELL_CAP_PERCENTAGE",
+                50.0,
+            )?,
             burn_execution_mode,
-            unlock_requires_manual_approval: parse_bool_env("PEX_UNLOCK_REQUIRES_MANUAL_APPROVAL", false)?,
+            unlock_requires_manual_approval: parse_bool_env(
+                "PEX_UNLOCK_REQUIRES_MANUAL_APPROVAL",
+                false,
+            )?,
             jwt_secret: required("JWT_SECRET")?,
             claude_base_url: env_or("CLAUDE_BASE_URL", "https://api.anthropic.com"),
+            anthropic_api_key: env_or("ANTHROPIC_API_KEY", ""),
+            claude_model: env_or("CLAUDE_MODEL", "claude-3-5-sonnet-latest"),
             copyleaks_base_url: env_or("COPYLEAKS_BASE_URL", "https://api.copyleaks.com"),
+            copyleaks_email: env_or("COPYLEAKS_EMAIL", ""),
+            copyleaks_api_key: env_or("COPYLEAKS_API_KEY", ""),
+            copyleaks_webhook_secret: env_or("COPYLEAKS_WEBHOOK_SECRET", ""),
             telnyx_base_url: env_or("TELNYX_BASE_URL", "https://api.telnyx.com"),
+            telnyx_api_key: env_or("TELNYX_API_KEY", ""),
+            telnyx_messaging_profile_id: env_or("TELNYX_MESSAGING_PROFILE_ID", ""),
+            telnyx_connection_id: env_or("TELNYX_CONNECTION_ID", ""),
+            telnyx_from_number: env_or("TELNYX_FROM_NUMBER", ""),
+            telnyx_webhook_public_key: env_or("TELNYX_WEBHOOK_PUBLIC_KEY", ""),
+            telnyx_webhook_signing_secret: env_or("TELNYX_WEBHOOK_SIGNING_SECRET", ""),
+            payscribe_base_url: env_or("PAYSCRIBE_BASE_URL", "https://api.payscribe.ng"),
+            payscribe_api_key: env_or("PAYSCRIBE_API_KEY", ""),
+            payscribe_secret_key: env_or("PAYSCRIBE_SECRET_KEY", ""),
+            payscribe_webhook_secret: env_or("PAYSCRIBE_WEBHOOK_SECRET", ""),
+            stripe_secret_key: env_or("STRIPE_SECRET_KEY", ""),
+            stripe_webhook_secret: env_or("STRIPE_WEBHOOK_SECRET", ""),
+            bank_rails_base_url: env_or("BANK_RAILS_BASE_URL", ""),
+            bank_rails_api_key: env_or("BANK_RAILS_API_KEY", ""),
+            bank_rails_webhook_secret: env_or("BANK_RAILS_WEBHOOK_SECRET", ""),
+            pyth_price_service_url: env_or("PYTH_PRICE_SERVICE_URL", "https://hermes.pyth.network"),
+            pyth_pex_price_feed_id: env_or("PYTH_PEX_PRICE_FEED_ID", ""),
+            pyth_sol_price_feed_id: env_or("PYTH_SOL_PRICE_FEED_ID", ""),
+            meteora_api_base_url: env_or("METEORA_API_BASE_URL", "https://dlmm-api.meteora.ag"),
+            meteora_dlmm_pair_address: env_or("METEORA_DLMM_PAIR_ADDRESS", ""),
         };
 
         config.validate()?;

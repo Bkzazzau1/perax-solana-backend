@@ -3,6 +3,7 @@ mod config;
 mod domains;
 mod error;
 mod infra;
+mod providers;
 mod state;
 
 use axum::{Router, response::Redirect, routing::get};
@@ -40,6 +41,7 @@ async fn main() -> GatewayResult<()> {
         .merge(domains::checkout::routes::router())
         .merge(domains::b2b_gateway::router())
         .merge(domains::telecom::routes::router())
+        .merge(providers::router())
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());

@@ -26,7 +26,10 @@ pub fn router() -> Router<AppState> {
             patch(update_credit_rate),
         )
         .route("/admin/api/pricing/credit-policy", get(get_credit_policy))
-        .route("/admin/api/pricing/credit-policy", patch(update_credit_policy))
+        .route(
+            "/admin/api/pricing/credit-policy",
+            patch(update_credit_policy),
+        )
         .route("/admin/api/pricing/promo-codes", get(list_promo_codes))
         .route("/admin/api/pricing/promo-codes", post(create_promo_code))
         .route(
@@ -343,14 +346,32 @@ async fn update_credit_policy(
     if let Some(value) = payload.credits_per_usd {
         validate_positive(value, "creditsPerUsd")?;
     }
-    validate_optional_percentage(payload.default_discount_percentage, "defaultDiscountPercentage")?;
+    validate_optional_percentage(
+        payload.default_discount_percentage,
+        "defaultDiscountPercentage",
+    )?;
     validate_optional_percentage(payload.pex_discount_percentage, "pexDiscountPercentage")?;
     validate_optional_percentage(payload.fiat_discount_percentage, "fiatDiscountPercentage")?;
-    validate_optional_percentage(payload.stablecoin_discount_percentage, "stablecoinDiscountPercentage")?;
-    validate_optional_percentage(payload.virtual_account_discount_percentage, "virtualAccountDiscountPercentage")?;
-    validate_optional_percentage(payload.fiat_revenue_burn_percentage, "fiatRevenueBurnPercentage")?;
-    validate_optional_percentage(payload.stablecoin_revenue_burn_percentage, "stablecoinRevenueBurnPercentage")?;
-    validate_optional_percentage(payload.pex_immediate_burn_percentage, "pexImmediateBurnPercentage")?;
+    validate_optional_percentage(
+        payload.stablecoin_discount_percentage,
+        "stablecoinDiscountPercentage",
+    )?;
+    validate_optional_percentage(
+        payload.virtual_account_discount_percentage,
+        "virtualAccountDiscountPercentage",
+    )?;
+    validate_optional_percentage(
+        payload.fiat_revenue_burn_percentage,
+        "fiatRevenueBurnPercentage",
+    )?;
+    validate_optional_percentage(
+        payload.stablecoin_revenue_burn_percentage,
+        "stablecoinRevenueBurnPercentage",
+    )?;
+    validate_optional_percentage(
+        payload.pex_immediate_burn_percentage,
+        "pexImmediateBurnPercentage",
+    )?;
     if let Some(value) = payload.pex_price_usd {
         validate_positive(value, "pexPriceUsd")?;
     }
@@ -659,7 +680,9 @@ fn clean_optional_text(value: Option<String>) -> Option<String> {
 fn normalize_code(code: &str) -> GatewayResult<String> {
     let normalized = code.trim().to_uppercase();
     if normalized.is_empty() {
-        return Err(GatewayError::Upstream("promo code cannot be empty".to_string()));
+        return Err(GatewayError::Upstream(
+            "promo code cannot be empty".to_string(),
+        ));
     }
     Ok(normalized)
 }
@@ -711,10 +734,15 @@ fn validate_optional_percentage(value: Option<f64>, field: &str) -> GatewayResul
     Ok(())
 }
 
-fn validate_time_window(starts_at: Option<DateTime<Utc>>, expires_at: Option<DateTime<Utc>>) -> GatewayResult<()> {
+fn validate_time_window(
+    starts_at: Option<DateTime<Utc>>,
+    expires_at: Option<DateTime<Utc>>,
+) -> GatewayResult<()> {
     if let (Some(start), Some(end)) = (starts_at, expires_at) {
         if end <= start {
-            return Err(GatewayError::Upstream("expiresAt must be after startsAt".to_string()));
+            return Err(GatewayError::Upstream(
+                "expiresAt must be after startsAt".to_string(),
+            ));
         }
     }
     Ok(())

@@ -138,17 +138,12 @@ pub fn evaluate_unlock_review(current_price_usd: f64) -> UnlockReview {
     let message = if should_release {
         format!(
             "PEX reached stage {} 3x trigger. Market-condition release can proceed only if TWAP, liquidity, buy-pressure, cooldown, daily cap, monthly cap, and emergency-pause gates pass. Calm-down/new base price becomes {:.8}. Next 3x trigger becomes {:.8}. Trading Company receives 50% of the approved release; all other eligible release wallets share the remaining 50%.",
-            stage.stage,
-            stage.new_base_price_usd,
-            next_trigger_price_usd,
+            stage.stage, stage.new_base_price_usd, next_trigger_price_usd,
         )
     } else {
         format!(
             "PEX remains below stage {} 3x trigger. Current base is {:.8}; trigger is {:.8}; calm-down/new base after release is {:.8}. No release is required.",
-            stage.stage,
-            stage.base_price_usd,
-            stage.trigger_price_usd,
-            stage.new_base_price_usd,
+            stage.stage, stage.base_price_usd, stage.trigger_price_usd, stage.new_base_price_usd,
         )
     };
 
@@ -176,7 +171,8 @@ pub fn release_allocation_preview(total_release_amount: u64) -> ReleaseAllocatio
         trading_company_amount,
         other_release_wallets_amount,
         trading_company_share_percentage: UNLOCK_POLICY.trading_company_release_share_percentage,
-        other_release_wallets_share_percentage: UNLOCK_POLICY.other_release_wallets_share_percentage,
+        other_release_wallets_share_percentage: UNLOCK_POLICY
+            .other_release_wallets_share_percentage,
     }
 }
 

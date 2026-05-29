@@ -1,7 +1,6 @@
 use chrono::{Datelike, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
@@ -35,19 +34,6 @@ pub struct PexRevenueEventRecord {
     pub revenue_month: NaiveDate,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-#[serde(rename_all = "camelCase")]
-pub struct PexMonthlySellCapRecord {
-    pub revenue_month: NaiveDate,
-    pub monthly_revenue_pex: f64,
-    pub monthly_burned_pex: f64,
-    pub monthly_remaining_pex: f64,
-    pub sell_cap_percentage: f64,
-    pub monthly_sell_cap_pex: f64,
-    pub monthly_sold_pex: f64,
-    pub monthly_sell_allowance_remaining_pex: f64,
-}
-
 pub async fn record_pex_revenue_event(
     state: &AppState,
     input: RecordPexRevenueInput,
@@ -55,7 +41,8 @@ pub async fn record_pex_revenue_event(
     let pex_received = input.pex_received.max(0.0);
     let credits_granted = input.credits_granted.max(0.0);
     let legacy_burn_percentage = state.config.pex_immediate_burn_percentage;
-    let legacy_pex_burn_amount = round_token_amount(pex_received * (legacy_burn_percentage / 100.0));
+    let legacy_pex_burn_amount =
+        round_token_amount(pex_received * (legacy_burn_percentage / 100.0));
     let legacy_pex_remaining_amount = round_token_amount(pex_received - legacy_pex_burn_amount);
     let revenue_month = current_revenue_month();
     let revenue_day = current_revenue_day();
@@ -152,32 +139,6 @@ pub async fn record_pex_revenue_event(
     .await?;
 
     tx.commit().await?;
-
-    Ok(record)
-}
-
-pub async fn get_monthly_sell_cap(
-    db: &PgPool,
-    revenue_month: NaiveDate,
-) -> GatewayResult<Option<PexMonthlySellCapRecord>> {
-    let record = sqlx::query_as::<_, PexMonthlySellCapRecord>(
-        r#"
-        select
-            revenue_month,
-            monthly_revenue_pex::float8 as monthly_revenue_pex,
-            monthly_burned_pex::float8 as monthly_burned_pex,
-            monthly_remaining_pex::float8 as monthly_remaining_pex,
-            sell_cap_percentage::float8 as sell_cap_percentage,
-            monthly_sell_cap_pex::float8 as monthly_sell_cap_pex,
-            monthly_sold_pex::float8 as monthly_sold_pex,
-            monthly_sell_allowance_remaining_pex::float8 as monthly_sell_allowance_remaining_pex
-        from pex_monthly_sell_cap_ledger
-        where revenue_month = $1
-        "#,
-    )
-    .bind(revenue_month)
-    .fetch_optional(db)
-    .await?;
 
     Ok(record)
 }

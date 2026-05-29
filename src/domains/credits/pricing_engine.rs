@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{error::{GatewayError, GatewayResult}, state::AppState};
+use crate::{
+    error::{GatewayError, GatewayResult},
+    state::AppState,
+};
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -88,7 +91,9 @@ pub async fn build_credit_quote(
 ) -> GatewayResult<CreditQuote> {
     let requested_credits = round_amount(input.requested_credits.max(0.0));
     if requested_credits <= 0.0 {
-        return Err(GatewayError::Upstream("requested credits must be greater than zero".to_string()));
+        return Err(GatewayError::Upstream(
+            "requested credits must be greater than zero".to_string(),
+        ));
     }
 
     if let Some(key) = input.idempotency_key.as_deref() {
@@ -99,17 +104,25 @@ pub async fn build_credit_quote(
 
     let policy = get_active_credit_policy(state).await?;
     if policy.credits_per_usd <= 0.0 || policy.pex_price_usd <= 0.0 {
-        return Err(GatewayError::Upstream("invalid credit pricing policy".to_string()));
+        return Err(GatewayError::Upstream(
+            "invalid credit pricing policy".to_string(),
+        ));
     }
 
     let promo = match input.promo_code.as_deref() {
-        Some(code) if !code.trim().is_empty() => get_valid_promo_code(state, code, requested_credits).await?,
+        Some(code) if !code.trim().is_empty() => {
+            get_valid_promo_code(state, code, requested_credits).await?
+        }
         _ => None,
     };
 
     let method_discount = method_discount_percentage(&policy, input.funding_method);
-    let promo_discount = promo.as_ref().map(|item| item.discount_percentage).unwrap_or(0.0);
-    let discount_percentage = clamp_percentage(policy.default_discount_percentage + method_discount + promo_discount);
+    let promo_discount = promo
+        .as_ref()
+        .map(|item| item.discount_percentage)
+        .unwrap_or(0.0);
+    let discount_percentage =
+        clamp_percentage(policy.default_discount_percentage + method_discount + promo_discount);
     let final_credits = round_amount(requested_credits * (1.0 - discount_percentage / 100.0));
     let usd_value = round_usd(final_credits / policy.credits_per_usd);
 
@@ -120,12 +133,9 @@ pub async fn build_credit_quote(
             Some(policy.pex_price_usd),
             policy.pex_immediate_burn_percentage,
         ),
-        CreditFundingMethod::Card | CreditFundingMethod::VirtualAccount => (
-            0.0,
-            usd_value,
-            None,
-            policy.fiat_revenue_burn_percentage,
-        ),
+        CreditFundingMethod::Card | CreditFundingMethod::VirtualAccount => {
+            (0.0, usd_value, None, policy.fiat_revenue_burn_percentage)
+        }
         CreditFundingMethod::Stablecoin => (
             0.0,
             usd_value,
@@ -188,7 +198,12 @@ pub async fn build_credit_quote(
     .fetch_one(&state.db)
     .await?;
 
-    Ok(row_to_quote(quote, input.funding_method, input.funding_method.asset_code(), policy.pex_price_source))
+    Ok(row_to_quote(
+        quote,
+        input.funding_method,
+        input.funding_method.asset_code(),
+        policy.pex_price_source,
+    ))
 }
 
 pub async fn get_credit_quote_by_reference(
@@ -222,9 +237,15 @@ pub async fn get_credit_quote_by_reference(
     .await?
     .ok_or_else(|| GatewayError::Upstream("credit quote not found".to_string()))?;
 
-    let method = parse_funding_method(&row.funding_method)
-        .ok_or_else(|| GatewayError::Upstream("stored quote has invalid funding method".to_string()))?;
-    Ok(row_to_quote(row, method, method.asset_code(), "stored_quote".to_string()))
+    let method = parse_funding_method(&row.funding_method).ok_or_else(|| {
+        GatewayError::Upstream("stored quote has invalid funding method".to_string())
+    })?;
+    Ok(row_to_quote(
+        row,
+        method,
+        method.asset_code(),
+        "stored_quote".to_string(),
+    ))
 }
 
 pub async fn mark_credit_quote_accepted(
@@ -251,24 +272,6 @@ pub async fn mark_credit_quote_accepted(
     Ok(())
 }
 
-pub async fn mark_credit_quote_credited(
-    state: &AppState,
-    quote_reference: &str,
-) -> GatewayResult<()> {
-    sqlx::query(
-        r#"
-        update credit_purchase_quotes
-        set status = 'credited', updated_at = now()
-        where quote_reference = $1 and status in ('quoted', 'accepted')
-        "#,
-    )
-    .bind(quote_reference.trim())
-    .execute(&state.db)
-    .await?;
-
-    Ok(())
-}
-
 async fn get_active_credit_policy(state: &AppState) -> GatewayResult<CreditPricingPolicyRecord> {
     sqlx::query_as::<_, CreditPricingPolicyRecord>(
         r#"
@@ -291,7 +294,9 @@ async fn get_active_credit_policy(state: &AppState) -> GatewayResult<CreditPrici
     )
     .fetch_optional(&state.db)
     .await?
-    .ok_or_else(|| GatewayError::Upstream("active credit pricing policy not configured".to_string()))
+    .ok_or_else(|| {
+        GatewayError::Upstream("active credit pricing policy not configured".to_string())
+    })
 }
 
 async fn get_valid_promo_code(
@@ -322,7 +327,10 @@ async fn get_valid_promo_code(
     Ok(promo)
 }
 
-async fn find_quote_by_idempotency_key(state: &AppState, key: &str) -> GatewayResult<Option<CreditQuote>> {
+async fn find_quote_by_idempotency_key(
+    state: &AppState,
+    key: &str,
+) -> GatewayResult<Option<CreditQuote>> {
     let row = sqlx::query_as::<_, CreditQuoteRow>(
         r#"
         select
@@ -373,7 +381,12 @@ struct CreditQuoteRow {
     status: String,
 }
 
-fn row_to_quote(row: CreditQuoteRow, method: CreditFundingMethod, asset_code: &str, pex_price_source: String) -> CreditQuote {
+fn row_to_quote(
+    row: CreditQuoteRow,
+    method: CreditFundingMethod,
+    asset_code: &str,
+    pex_price_source: String,
+) -> CreditQuote {
     CreditQuote {
         quote_id: row.id,
         quote_reference: row.quote_reference,
@@ -394,7 +407,10 @@ fn row_to_quote(row: CreditQuoteRow, method: CreditFundingMethod, asset_code: &s
     }
 }
 
-fn method_discount_percentage(policy: &CreditPricingPolicyRecord, method: CreditFundingMethod) -> f64 {
+fn method_discount_percentage(
+    policy: &CreditPricingPolicyRecord,
+    method: CreditFundingMethod,
+) -> f64 {
     match method {
         CreditFundingMethod::Pex => policy.pex_discount_percentage,
         CreditFundingMethod::Card => policy.fiat_discount_percentage,

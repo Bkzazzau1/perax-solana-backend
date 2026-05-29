@@ -3,13 +3,14 @@ use axum::{
     extract::{Path, Query, State},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
     domains::auth::middleware::AuthenticatedAccount,
     error::{GatewayError, GatewayResult},
     infra::cache,
+    providers::TelnyxClient,
     state::AppState,
 };
 
@@ -187,18 +188,8 @@ pub async fn search_global_numbers(
     let country_code = normalize_country_code(&query.country_code)?;
     let limit = query.limit.unwrap_or(5).clamp(1, 25);
 
-    let response = state
-        .http
-        .get(format!(
-            "{}/v2/available_phone_numbers",
-            state.config.telnyx_base_url
-        ))
-        .bearer_auth(&state.config.jwt_secret)
-        .query(&[
-            ("filter[country_code]", country_code.as_str()),
-            ("filter[limit]", &limit.to_string()),
-        ])
-        .send()
+    let response = TelnyxClient::new(&state)
+        .search_available_numbers(&country_code, limit)
         .await?;
 
     if !response.status().is_success() {
@@ -555,16 +546,8 @@ pub async fn purchase_number(
         _ => return Err(GatewayError::InsufficientCredits),
     }
 
-    let order_payload = json!({
-        "phone_numbers": [{ "phone_number": phone_number }]
-    });
-
-    let response = state
-        .http
-        .post(format!("{}/v2/number_orders", state.config.telnyx_base_url))
-        .bearer_auth(&state.config.jwt_secret)
-        .json(&order_payload)
-        .send()
+    let response = TelnyxClient::new(&state)
+        .order_number(&phone_number)
         .await?;
 
     if !response.status().is_success() {

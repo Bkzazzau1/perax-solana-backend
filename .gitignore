@@ -1,6 +1,7 @@
 # Rust build output
 /target
 target/
+target_verify/
 
 # Environment and secrets
 .env

@@ -40,7 +40,7 @@ pub struct AdminLoginResponse {
 
 #[derive(Debug, Clone)]
 pub struct AuthenticatedAdmin {
-    pub username: String,
+    pub _username: String,
 }
 
 pub fn router() -> Router<AppState> {
@@ -114,7 +114,7 @@ impl FromRequestParts<AppState> for AuthenticatedAdmin {
         }
 
         Ok(AuthenticatedAdmin {
-            username: token_data.claims.sub,
+            _username: token_data.claims.sub,
         })
     }
 }

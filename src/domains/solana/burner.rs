@@ -69,12 +69,7 @@ async fn inspect_daily_realized_burn_schedule(state: &AppState) -> Result<(), Ga
 
     for burn in scheduled_burns {
         if burn.burn_amount_pex <= 0.0 || burn.eligible_revenue_amount_pex <= 0.0 {
-            mark_burn_failed(
-                state,
-                burn.id,
-                "Zero eligible revenue or zero burn amount",
-            )
-            .await?;
+            mark_burn_failed(state, burn.id, "Zero eligible revenue or zero burn amount").await?;
             continue;
         }
 
@@ -93,7 +88,11 @@ async fn inspect_daily_realized_burn_schedule(state: &AppState) -> Result<(), Ga
         );
 
         // Disabled mode means: prepare and log only. No on-chain execution.
-        if !state.config.burn_execution_mode.allows_automatic_execution() {
+        if !state
+            .config
+            .burn_execution_mode
+            .allows_automatic_execution()
+        {
             continue;
         }
 

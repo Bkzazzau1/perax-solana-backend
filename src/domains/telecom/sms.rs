@@ -4,13 +4,14 @@ use axum::{
     extract::{Query, State},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
     domains::{auth::middleware::AuthenticatedAccount, pricing},
     error::{GatewayError, GatewayResult},
     infra::cache,
+    providers::TelnyxClient,
     state::AppState,
 };
 
@@ -110,21 +111,9 @@ pub async fn send_sms(
         "Pre-flight SMS balance debited using backend pricing, dispatching message to downstream carrier"
     );
 
-    let telnyx_sms_url = format!("{}/v2/messages", state.config.telnyx_base_url);
-    let telnyx_payload = json!({
-        "to": request.to,
-        "from": request.from,
-        "text": request.body,
-    });
-
-    let response = state
-        .http
-        .post(&telnyx_sms_url)
-        .bearer_auth(&state.config.jwt_secret)
-        .json(&telnyx_payload)
-        .send()
-        .await
-        .map_err(GatewayError::Http)?;
+    let response = TelnyxClient::new(&state)
+        .send_sms(&request.to, &request.from, &request.body)
+        .await?;
 
     if !response.status().is_success() {
         let err_text = response.text().await.unwrap_or_default();

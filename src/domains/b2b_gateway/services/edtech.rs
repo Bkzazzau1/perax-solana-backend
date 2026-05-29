@@ -5,6 +5,7 @@ use uuid::Uuid;
 use crate::{
     error::{GatewayError, GatewayResult},
     infra::cache,
+    providers::CopyleaksClient,
     state::AppState,
 };
 
@@ -53,33 +54,10 @@ pub async fn scan_payload(
         "Pre-scan billing processed successfully, dispatching verification payload to Copyleaks"
     );
 
-    // 3. Upstream Provider Integration Pipeline
-    let copyleaks_endpoint = format!(
-        "{}/v3/education/scan/submit",
-        state.config.copyleaks_base_url
-    );
-
-    // Construct corporate payload tracking metadata headers
     let scan_id = Uuid::new_v4().to_string();
-    let upstream_payload = json!({
-        "text": text_content,
-        "properties": {
-            "aiDetection": { "submit": true },
-            "plagiarism": { "submit": true }
-        }
-    });
-
-    let response = state
-        .http
-        .post(&copyleaks_endpoint)
-        .header(
-            "Authorization",
-            format!("Bearer {}", state.config.jwt_secret),
-        ) // Secure master key binding
-        .json(&upstream_payload)
-        .send()
-        .await
-        .map_err(GatewayError::Http)?;
+    let response = CopyleaksClient::new(state)
+        .submit_scan(&scan_id, text_content)
+        .await?;
 
     if !response.status().is_success() {
         let err_text = response.text().await.unwrap_or_default();

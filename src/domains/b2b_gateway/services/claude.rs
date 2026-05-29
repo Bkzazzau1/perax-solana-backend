@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::{
     error::{GatewayError, GatewayResult},
     infra::cache,
+    providers::AnthropicClient,
     state::AppState,
 };
 
@@ -28,18 +29,10 @@ pub async fn proxy_message_stream(
         "Claude AI proxy request validated, initiating upstream network pipe"
     );
 
-    // 2. Prepare the Outbound Request Payload matching Anthropic's specification
-    let upstream_url = format!("{}/v1/messages", state.config.claude_base_url);
-
-    let response = state
-        .http
-        .post(&upstream_url)
-        .header("x-api-key", &state.config.jwt_secret) // Appends master Claude credential securely [cite: 115]
-        .header("anthropic-version", "2023-06-01") // Required Anthropic platform spec header
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| GatewayError::Http(e))?;
+    // 2. Prepare the outbound request using the Anthropic provider credential.
+    let response = AnthropicClient::new(state)
+        .stream_messages(&payload)
+        .await?;
 
     if !response.status().is_success() {
         let err_text = response.text().await.unwrap_or_default();

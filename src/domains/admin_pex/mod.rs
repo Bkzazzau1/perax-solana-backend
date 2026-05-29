@@ -1,21 +1,43 @@
-use axum::{Json, Router, extract::{Query, State}, routing::{get, post}};
+use axum::{
+    Json, Router,
+    extract::{Query, State},
+    routing::{get, post},
+};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{error::{GatewayError, GatewayResult}, state::AppState};
+use crate::{
+    error::{GatewayError, GatewayResult},
+    state::AppState,
+};
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/admin/api/pex/revenue-events", get(list_pex_revenue_events))
-        .route("/admin/api/pex/monthly-sell-cap", get(list_monthly_sell_cap))
+        .route(
+            "/admin/api/pex/revenue-events",
+            get(list_pex_revenue_events),
+        )
+        .route(
+            "/admin/api/pex/monthly-sell-cap",
+            get(list_monthly_sell_cap),
+        )
         .route("/admin/api/pex/daily-burns", get(list_daily_realized_burns))
-        .route("/admin/api/pex/sell-events", get(list_revenue_token_account_sell_events))
-        .route("/admin/api/pex/sell-events/declare", post(declare_revenue_token_account_sale))
+        .route(
+            "/admin/api/pex/sell-events",
+            get(list_revenue_token_account_sell_events),
+        )
+        .route(
+            "/admin/api/pex/sell-events/declare",
+            post(declare_revenue_token_account_sale),
+        )
 }
 
 #[derive(Debug, Deserialize)]
-struct RevenueEventQuery { limit: Option<i64>, revenue_month: Option<NaiveDate> }
+struct RevenueEventQuery {
+    limit: Option<i64>,
+    revenue_month: Option<NaiveDate>,
+}
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
@@ -40,9 +62,15 @@ struct PexRevenueEventRecord {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct PexRevenueEventsResponse { count: usize, events: Vec<PexRevenueEventRecord> }
+struct PexRevenueEventsResponse {
+    count: usize,
+    events: Vec<PexRevenueEventRecord>,
+}
 
-async fn list_pex_revenue_events(State(state): State<AppState>, Query(query): Query<RevenueEventQuery>) -> GatewayResult<Json<PexRevenueEventsResponse>> {
+async fn list_pex_revenue_events(
+    State(state): State<AppState>,
+    Query(query): Query<RevenueEventQuery>,
+) -> GatewayResult<Json<PexRevenueEventsResponse>> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let revenue_month = query.revenue_month.unwrap_or_else(current_revenue_month);
     let events = sqlx::query_as::<_, PexRevenueEventRecord>(
@@ -59,12 +87,21 @@ async fn list_pex_revenue_events(State(state): State<AppState>, Query(query): Qu
         order by credited_at desc
         limit $2
         "#,
-    ).bind(revenue_month).bind(limit).fetch_all(&state.db).await?;
-    Ok(Json(PexRevenueEventsResponse { count: events.len(), events }))
+    )
+    .bind(revenue_month)
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(PexRevenueEventsResponse {
+        count: events.len(),
+        events,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
-struct SellCapQuery { limit: Option<i64> }
+struct SellCapQuery {
+    limit: Option<i64>,
+}
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
@@ -84,9 +121,15 @@ struct MonthlySellCapRecord {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct MonthlySellCapResponse { count: usize, ledgers: Vec<MonthlySellCapRecord> }
+struct MonthlySellCapResponse {
+    count: usize,
+    ledgers: Vec<MonthlySellCapRecord>,
+}
 
-async fn list_monthly_sell_cap(State(state): State<AppState>, Query(query): Query<SellCapQuery>) -> GatewayResult<Json<MonthlySellCapResponse>> {
+async fn list_monthly_sell_cap(
+    State(state): State<AppState>,
+    Query(query): Query<SellCapQuery>,
+) -> GatewayResult<Json<MonthlySellCapResponse>> {
     let limit = query.limit.unwrap_or(24).clamp(1, 60);
     let ledgers = sqlx::query_as::<_, MonthlySellCapRecord>(
         r#"
@@ -102,12 +145,21 @@ async fn list_monthly_sell_cap(State(state): State<AppState>, Query(query): Quer
         order by revenue_month desc
         limit $1
         "#,
-    ).bind(limit).fetch_all(&state.db).await?;
-    Ok(Json(MonthlySellCapResponse { count: ledgers.len(), ledgers }))
+    )
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(MonthlySellCapResponse {
+        count: ledgers.len(),
+        ledgers,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
-struct DailyBurnQuery { limit: Option<i64>, burn_status: Option<String> }
+struct DailyBurnQuery {
+    limit: Option<i64>,
+    burn_status: Option<String>,
+}
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
@@ -135,9 +187,16 @@ struct DailyRealizedBurnRecord {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DailyRealizedBurnsResponse { count: usize, burns: Vec<DailyRealizedBurnRecord>, message: String }
+struct DailyRealizedBurnsResponse {
+    count: usize,
+    burns: Vec<DailyRealizedBurnRecord>,
+    message: String,
+}
 
-async fn list_daily_realized_burns(State(state): State<AppState>, Query(query): Query<DailyBurnQuery>) -> GatewayResult<Json<DailyRealizedBurnsResponse>> {
+async fn list_daily_realized_burns(
+    State(state): State<AppState>,
+    Query(query): Query<DailyBurnQuery>,
+) -> GatewayResult<Json<DailyRealizedBurnsResponse>> {
     let limit = query.limit.unwrap_or(30).clamp(1, 100);
     let status = clean_optional_text(query.burn_status);
     let burns = sqlx::query_as::<_, DailyRealizedBurnRecord>(
@@ -169,7 +228,11 @@ async fn list_daily_realized_burns(State(state): State<AppState>, Query(query): 
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct DeclareSellEventRequest { pex_sell_amount: f64, sell_reason: Option<String>, revenue_month: Option<NaiveDate> }
+struct DeclareSellEventRequest {
+    pex_sell_amount: f64,
+    sell_reason: Option<String>,
+    revenue_month: Option<NaiveDate>,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -184,11 +247,16 @@ struct DeclareSellEventResponse {
     message: String,
 }
 
-async fn declare_revenue_token_account_sale(State(state): State<AppState>, Json(request): Json<DeclareSellEventRequest>) -> GatewayResult<Json<DeclareSellEventResponse>> {
+async fn declare_revenue_token_account_sale(
+    State(state): State<AppState>,
+    Json(request): Json<DeclareSellEventRequest>,
+) -> GatewayResult<Json<DeclareSellEventResponse>> {
     let revenue_month = request.revenue_month.unwrap_or_else(current_revenue_month);
     let pex_sell_amount = round_token_amount(request.pex_sell_amount.max(0.0));
     if pex_sell_amount <= 0.0 {
-        return Err(GatewayError::Upstream("pexSellAmount must be greater than 0".to_string()));
+        return Err(GatewayError::Upstream(
+            "pexSellAmount must be greater than 0".to_string(),
+        ));
     }
 
     let mut tx = state.db.begin().await?;
@@ -206,14 +274,37 @@ async fn declare_revenue_token_account_sale(State(state): State<AppState>, Json(
         where revenue_month = $1
         for update
         "#,
-    ).bind(revenue_month).fetch_optional(&mut *tx).await?;
+    )
+    .bind(revenue_month)
+    .fetch_optional(&mut *tx)
+    .await?;
 
     let Some(ledger) = ledger else {
-        return Ok(Json(DeclareSellEventResponse { accepted: false, event_id: None, revenue_month, requested_sell_amount: pex_sell_amount, monthly_sell_cap_pex: 0.0, monthly_sold_pex: 0.0, monthly_sell_allowance_remaining_pex: 0.0, message: "No PEX revenue ledger exists for this month. Sale declaration rejected.".to_string() }));
+        return Ok(Json(DeclareSellEventResponse {
+            accepted: false,
+            event_id: None,
+            revenue_month,
+            requested_sell_amount: pex_sell_amount,
+            monthly_sell_cap_pex: 0.0,
+            monthly_sold_pex: 0.0,
+            monthly_sell_allowance_remaining_pex: 0.0,
+            message: "No PEX revenue ledger exists for this month. Sale declaration rejected."
+                .to_string(),
+        }));
     };
 
     if pex_sell_amount > ledger.monthly_sell_allowance_remaining_pex {
-        return Ok(Json(DeclareSellEventResponse { accepted: false, event_id: None, revenue_month, requested_sell_amount: pex_sell_amount, monthly_sell_cap_pex: ledger.monthly_sell_cap_pex, monthly_sold_pex: ledger.monthly_sold_pex, monthly_sell_allowance_remaining_pex: ledger.monthly_sell_allowance_remaining_pex, message: "Sale declaration rejected because it exceeds the 50% monthly PEX sell cap.".to_string() }));
+        return Ok(Json(DeclareSellEventResponse {
+            accepted: false,
+            event_id: None,
+            revenue_month,
+            requested_sell_amount: pex_sell_amount,
+            monthly_sell_cap_pex: ledger.monthly_sell_cap_pex,
+            monthly_sold_pex: ledger.monthly_sold_pex,
+            monthly_sell_allowance_remaining_pex: ledger.monthly_sell_allowance_remaining_pex,
+            message: "Sale declaration rejected because it exceeds the 50% monthly PEX sell cap."
+                .to_string(),
+        }));
     }
 
     let event_id = sqlx::query_scalar::<_, Uuid>(
@@ -232,14 +323,21 @@ async fn declare_revenue_token_account_sale(State(state): State<AppState>, Json(
             updated_at = now()
         where revenue_month = $2
         "#,
-    ).bind(pex_sell_amount).bind(revenue_month).execute(&mut *tx).await?;
+    )
+    .bind(pex_sell_amount)
+    .bind(revenue_month)
+    .execute(&mut *tx)
+    .await?;
 
     tx.commit().await?;
     Ok(Json(DeclareSellEventResponse { accepted: true, event_id: Some(event_id), revenue_month, requested_sell_amount: pex_sell_amount, monthly_sell_cap_pex: ledger.monthly_sell_cap_pex, monthly_sold_pex: ledger.monthly_sold_pex + pex_sell_amount, monthly_sell_allowance_remaining_pex: ledger.monthly_sell_allowance_remaining_pex - pex_sell_amount, message: "Sale declared within the 50% monthly PEX sell cap. It still requires approval before execution.".to_string() }))
 }
 
 #[derive(Debug, Deserialize)]
-struct SellEventsQuery { limit: Option<i64>, revenue_month: Option<NaiveDate> }
+struct SellEventsQuery {
+    limit: Option<i64>,
+    revenue_month: Option<NaiveDate>,
+}
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
@@ -256,9 +354,15 @@ struct RevenueTokenAccountSellEventRecord {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RevenueTokenAccountSellEventsResponse { count: usize, events: Vec<RevenueTokenAccountSellEventRecord> }
+struct RevenueTokenAccountSellEventsResponse {
+    count: usize,
+    events: Vec<RevenueTokenAccountSellEventRecord>,
+}
 
-async fn list_revenue_token_account_sell_events(State(state): State<AppState>, Query(query): Query<SellEventsQuery>) -> GatewayResult<Json<RevenueTokenAccountSellEventsResponse>> {
+async fn list_revenue_token_account_sell_events(
+    State(state): State<AppState>,
+    Query(query): Query<SellEventsQuery>,
+) -> GatewayResult<Json<RevenueTokenAccountSellEventsResponse>> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let revenue_month = query.revenue_month.unwrap_or_else(current_revenue_month);
     let events = sqlx::query_as::<_, RevenueTokenAccountSellEventRecord>(
@@ -271,13 +375,20 @@ async fn list_revenue_token_account_sell_events(State(state): State<AppState>, Q
         limit $2
         "#,
     ).bind(revenue_month).bind(limit).fetch_all(&state.db).await?;
-    Ok(Json(RevenueTokenAccountSellEventsResponse { count: events.len(), events }))
+    Ok(Json(RevenueTokenAccountSellEventsResponse {
+        count: events.len(),
+        events,
+    }))
 }
 
 fn clean_optional_text(value: Option<String>) -> Option<String> {
     value.and_then(|text| {
         let trimmed = text.trim();
-        if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
     })
 }
 

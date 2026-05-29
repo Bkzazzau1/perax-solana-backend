@@ -6,9 +6,11 @@ use crate::{
     domains::{
         credits::pricing_engine::{
             BuildCreditQuoteInput, CreditFundingMethod, CreditQuote, build_credit_quote,
-            get_credit_quote_by_reference, mark_credit_quote_accepted, mark_credit_quote_credited,
+            get_credit_quote_by_reference, mark_credit_quote_accepted,
         },
-        solana::revenue_ledger::{RecordPexRevenueInput, record_pex_revenue_event},
+        payments::verification::{
+            CreatePaymentIntentRequest, PaymentIntentRecord, create_intent_for_quote,
+        },
     },
     error::{GatewayError, GatewayResult},
     state::AppState,
@@ -39,7 +41,6 @@ pub struct BuyCreditsRequest {
     pub pex_balance: Option<f64>,
     pub reference_hex: Option<String>,
     pub payer_wallet: Option<String>,
-    pub token_mint: Option<String>,
     pub promo_code: Option<String>,
     pub idempotency_key: Option<String>,
 }
@@ -77,6 +78,7 @@ pub struct BuyCreditsResponse {
     pub quote: CreditQuote,
     pub status: String,
     pub message: String,
+    pub payment_intent: Option<PaymentIntentRecord>,
     pub pex_revenue_ledger: Option<PexRevenueLedgerSummary>,
 }
 
@@ -141,89 +143,50 @@ async fn buy_credits(
         ));
     }
 
-    let remaining_pex = payload.pex_balance.map(|balance| balance - quote.pex_required);
-    let accepted = quote.final_credits > 0.0 && remaining_pex.map(|value| value >= 0.0).unwrap_or(true);
+    let remaining_pex = payload
+        .pex_balance
+        .map(|balance| balance - quote.pex_required);
+    let accepted =
+        quote.final_credits > 0.0 && remaining_pex.map(|value| value >= 0.0).unwrap_or(true);
 
-    let mut pex_revenue_ledger = None;
     let mut status = if accepted {
-        "pending_settlement".to_string()
+        "pending_payment_verification".to_string()
     } else {
         "rejected".to_string()
     };
     let mut message = if accepted {
         format!(
-            "Credit purchase uses stored quote {}. Supplier settlement remains fiat/stablecoin based.",
+            "Credit purchase accepted for quote {}. Create/complete payment verification before Credits are granted.",
             quote.quote_reference
         )
     } else {
         "Credit purchase rejected. Check amount or available PEX balance.".to_string()
     };
+    let mut payment_intent = None;
 
     if accepted {
         mark_credit_quote_accepted(&state, &quote.quote_reference).await?;
-    }
-
-    if accepted && matches!(payload.method, CreditFundingMethod::Pex) {
-        let reference_hex = payload.reference_hex.clone().ok_or_else(|| {
-            GatewayError::Upstream(
-                "referenceHex is required when buying Credits with PEX".to_string(),
-            )
-        })?;
-
-        let record = record_pex_revenue_event(
+        let intent = create_intent_for_quote(
             &state,
-            RecordPexRevenueInput {
-                reference_hex,
+            &quote,
+            CreatePaymentIntentRequest {
+                quote_reference: quote.quote_reference.clone(),
+                user_id: None,
                 payer_wallet: payload.payer_wallet.clone(),
-                token_mint: payload.token_mint.clone(),
-                pex_received: quote.pex_required,
-                credits_granted: quote.final_credits,
-                service_code: Some("credits_buy".to_string()),
-                raw_event: Some(serde_json::json!({
-                    "quoteReference": quote.quote_reference,
-                    "fundingMethod": quote.funding_method,
-                    "usdValue": quote.usd_value,
-                    "pexPriceUsd": quote.pex_price_usd,
-                    "discountPercentage": quote.discount_percentage,
-                    "promoCode": quote.promo_code,
-                    "idempotencyKey": payload.idempotency_key,
-                    "burnPercentage": quote.burn_percentage,
-                    "burnUsdValue": quote.burn_usd_value
-                })),
+                provider: None,
+                provider_reference: None,
+                reference_hex: payload.reference_hex.clone(),
+                idempotency_key: payload.idempotency_key.clone(),
             },
         )
         .await?;
 
-        mark_credit_quote_credited(&state, &quote.quote_reference).await?;
-
-        status = "credited_and_burn_declared".to_string();
+        status = "payment_intent_created".to_string();
         message = format!(
-            "Credits granted from stored quote {}. PEX revenue recorded; {}% immediate burn declared and remaining PEX assigned to Trading Company revenue account.",
-            quote.quote_reference,
-            record.immediate_burn_percentage
+            "Payment intent {} created for quote {} using {}. Credits will be granted only after payment verification succeeds.",
+            intent.intent_reference, quote.quote_reference, quote.asset_code
         );
-
-        pex_revenue_ledger = Some(PexRevenueLedgerSummary {
-            event_id: record.id,
-            reference_hex: record.reference_hex,
-            pex_received: record.pex_received,
-            credits_granted: record.credits_granted,
-            immediate_burn_percentage: record.immediate_burn_percentage,
-            pex_burn_amount: record.pex_burn_amount,
-            pex_remaining_amount: record.pex_remaining_amount,
-            burn_status: record.burn_status,
-        });
-    }
-
-    if accepted && !matches!(payload.method, CreditFundingMethod::Pex) {
-        mark_credit_quote_credited(&state, &quote.quote_reference).await?;
-        status = "credited_pending_revenue_burn_allocation".to_string();
-        message = format!(
-            "Credits granted from stored quote {} using {}. Fiat/stablecoin revenue burn allocation recorded by policy at {}% of USD value; supplier settlement remains fiat/stablecoin based.",
-            quote.quote_reference,
-            quote.asset_code,
-            quote.burn_percentage
-        );
+        payment_intent = Some(intent);
     }
 
     Ok(Json(BuyCreditsResponse {
@@ -248,7 +211,8 @@ async fn buy_credits(
         quote,
         status,
         message,
-        pex_revenue_ledger,
+        payment_intent,
+        pex_revenue_ledger: None,
     }))
 }
 
@@ -264,17 +228,11 @@ fn format_quote_message(quote: &CreditQuote) -> String {
         ),
         CreditFundingMethod::Card | CreditFundingMethod::VirtualAccount => format!(
             "Admin policy price: {} Credits costs ${:.2}. User pays ${:.2}. Discount: {}%.",
-            quote.final_credits,
-            quote.usd_value,
-            quote.fiat_required,
-            quote.discount_percentage
+            quote.final_credits, quote.usd_value, quote.fiat_required, quote.discount_percentage
         ),
         CreditFundingMethod::Stablecoin => format!(
             "Admin policy price: {} Credits costs ${:.2}. User pays {:.2} USDC/stablecoin. Discount: {}%.",
-            quote.final_credits,
-            quote.usd_value,
-            quote.fiat_required,
-            quote.discount_percentage
+            quote.final_credits, quote.usd_value, quote.fiat_required, quote.discount_percentage
         ),
     }
 }
