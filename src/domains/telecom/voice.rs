@@ -370,16 +370,10 @@ pub async fn receive_voice_webhook(
 
     let raw_event: Value = serde_json::from_slice(&body)
         .map_err(|_| GatewayError::Upstream("Telnyx webhook body is invalid JSON".to_string()))?;
-    let event_type = raw_event
-        .get("event_type")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown")
-        .to_string();
-    let webhook_id = raw_event
-        .get("webhook_id")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let payload = raw_event.get("payload").cloned().unwrap_or(Value::Null);
+    let event = normalize_telnyx_event(&raw_event);
+    let event_type = event.event_type;
+    let webhook_id = event.webhook_id;
+    let payload = event.payload;
     let call_id = payload
         .get("client_state")
         .and_then(Value::as_str)
@@ -392,12 +386,21 @@ pub async fn receive_voice_webhook(
     let call_leg_id = payload
         .get("call_leg_id")
         .and_then(Value::as_str)
+        .or_else(|| raw_event.get("call_leg_id").and_then(Value::as_str))
         .map(str::to_string);
     let call_session_id = payload
         .get("call_session_id")
         .and_then(Value::as_str)
+        .or_else(|| raw_event.get("call_session_id").and_then(Value::as_str))
         .map(str::to_string);
-    let occurred_at = parse_event_time(payload.get("occurred_at").and_then(Value::as_str));
+    let occurred_at = event.occurred_at.or_else(|| {
+        parse_event_time(
+            payload
+                .get("occurred_at")
+                .and_then(Value::as_str)
+                .or_else(|| raw_event.get("event_timestamp").and_then(Value::as_str)),
+        )
+    });
 
     sqlx::query(
         r#"
@@ -448,6 +451,51 @@ pub async fn receive_voice_webhook(
         webhook_id,
         call_id,
     }))
+}
+
+struct NormalizedTelnyxEvent {
+    event_type: String,
+    webhook_id: Option<String>,
+    occurred_at: Option<DateTime<Utc>>,
+    payload: Value,
+}
+
+fn normalize_telnyx_event(raw_event: &Value) -> NormalizedTelnyxEvent {
+    let event = raw_event
+        .get("data")
+        .or_else(|| {
+            raw_event
+                .get("metadata")
+                .and_then(|metadata| metadata.get("event"))
+        })
+        .unwrap_or(raw_event);
+
+    let event_type = event
+        .get("event_type")
+        .and_then(Value::as_str)
+        .or_else(|| raw_event.get("event_type").and_then(Value::as_str))
+        .or_else(|| raw_event.get("name").and_then(Value::as_str))
+        .unwrap_or("unknown")
+        .to_string();
+    let webhook_id = raw_event
+        .get("webhook_id")
+        .and_then(Value::as_str)
+        .or_else(|| event.get("id").and_then(Value::as_str))
+        .map(str::to_string);
+    let occurred_at = parse_event_time(
+        event
+            .get("occurred_at")
+            .and_then(Value::as_str)
+            .or_else(|| raw_event.get("event_timestamp").and_then(Value::as_str)),
+    );
+    let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+
+    NormalizedTelnyxEvent {
+        event_type,
+        webhook_id,
+        occurred_at,
+        payload,
+    }
 }
 
 pub async fn speak_call(
