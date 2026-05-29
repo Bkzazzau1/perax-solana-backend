@@ -139,49 +139,22 @@ function instructionDiscriminator(name) {
 
 function encodeMarketConditionBurnParams(payload) {
   const amount = Number(payload.amountBaseUnits);
-  const eligibleRevenueAmount = Number(payload.eligibleRevenueBaseUnits);
-  const burnRateBps = Number(payload.burnRateBps);
-  const marketHealthScore = Number(payload.marketHealthScore);
-  const observedAtUnix = Number(payload.observedAtUnix);
 
   if (!Number.isSafeInteger(amount) || amount <= 0) {
     throw new Error('amountBaseUnits must be a positive safe integer');
-  }
-  if (!Number.isSafeInteger(eligibleRevenueAmount) || eligibleRevenueAmount <= 0) {
-    throw new Error('eligibleRevenueBaseUnits must be a positive safe integer');
-  }
-  if (!Number.isInteger(burnRateBps) || burnRateBps < 0 || burnRateBps > 10000) {
-    throw new Error('burnRateBps must be between 0 and 10000');
-  }
-  if (!Number.isInteger(marketHealthScore) || marketHealthScore < 0 || marketHealthScore > 100) {
-    throw new Error('marketHealthScore must be between 0 and 100');
-  }
-  if (!Number.isSafeInteger(observedAtUnix) || observedAtUnix <= 0) {
-    throw new Error('observedAtUnix must be a positive unix timestamp');
   }
 
   const decisionId = hexTo32Bytes(payload.decisionIdHex, 'decisionIdHex');
 
   return Buffer.concat([
-    instructionDiscriminator('execute_market_condition_burn'),
+    instructionDiscriminator('burn_from_trading_company'),
     u64Le(amount),
-    u64Le(eligibleRevenueAmount),
-    u16Le(burnRateBps),
-    Buffer.from([marketHealthScore]),
-    i64Le(observedAtUnix),
     decisionId,
   ]);
 }
 
 function deriveStatePda(programId) {
   return PublicKey.findProgramAddressSync([Buffer.from('perax-state')], programId)[0];
-}
-
-function deriveBurnRecordPda(programId, decisionIdHex) {
-  return PublicKey.findProgramAddressSync(
-    [Buffer.from('burn'), hexTo32Bytes(decisionIdHex, 'decisionIdHex')],
-    programId,
-  )[0];
 }
 
 async function executeBurn(payload) {
@@ -222,23 +195,15 @@ async function executeBurn(payload) {
     throw new Error('tradingCompanyRevenueTokenAccount balance is lower than requested burn amount');
   }
 
-  const burnRecordPda = deriveBurnRecordPda(programId, payload.decisionIdHex);
-  const existingBurnRecord = await connection.getAccountInfo(burnRecordPda);
-  if (existingBurnRecord) {
-    throw new Error('burn decision already executed on-chain');
-  }
-
   const instruction = new TransactionInstruction({
     programId,
     keys: [
       { pubkey: statePda, isSigner: false, isWritable: false },
       { pubkey: authority.publicKey, isSigner: true, isWritable: true },
       { pubkey: tradingCompanyAuthority.publicKey, isSigner: true, isWritable: false },
-      { pubkey: burnRecordPda, isSigner: false, isWritable: true },
       { pubkey: tradingCompanyRevenueTokenAccount, isSigner: false, isWritable: true },
       { pubkey: tokenMint, isSigner: false, isWritable: true },
       { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],
     data: encodeMarketConditionBurnParams(payload),
   });
@@ -251,15 +216,9 @@ async function executeBurn(payload) {
     { commitment: 'confirmed' },
   );
 
-  const burnRecordInfo = await connection.getAccountInfo(burnRecordPda, 'confirmed');
-
-  if (!burnRecordInfo) {
-    throw new Error('BurnExecutionRecord was not created after transaction confirmation');
-  }
-
   return {
     signature,
-    burnRecord: burnRecordPda.toBase58(),
+    burnRecord: String(payload.decisionIdHex).trim().replace(/^0x/i, '').toLowerCase(),
     authority: authority.publicKey.toBase58(),
     tradingCompanyAuthority: tradingCompanyAuthority.publicKey.toBase58(),
   };
