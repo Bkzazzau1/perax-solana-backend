@@ -14,30 +14,30 @@ pub const DEFAULT_PEX_INITIAL_LIQUIDITY_QUOTE_USD: f64 = 4_560.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BurnExecutionMode {
-    Manual,
-    Approved,
+    Disabled,
+    Automatic,
 }
 
 impl BurnExecutionMode {
     pub fn from_env_value(value: &str) -> GatewayResult<Self> {
         match value.trim().to_lowercase().as_str() {
-            "manual" => Ok(Self::Manual),
-            "approved" => Ok(Self::Approved),
+            "disabled" | "manual" | "prepare_only" | "prepare-only" => Ok(Self::Disabled),
+            "automatic" | "auto" | "system" | "approved" => Ok(Self::Automatic),
             other => Err(GatewayError::Config(format!(
-                "BURN_EXECUTION_MODE must be either 'manual' or 'approved', got '{other}'"
+                "BURN_EXECUTION_MODE must be either 'disabled' or 'automatic', got '{other}'"
             ))),
         }
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Manual => "manual",
-            Self::Approved => "approved",
+            Self::Disabled => "disabled",
+            Self::Automatic => "automatic",
         }
     }
 
-    pub fn allows_approved_execution(&self) -> bool {
-        matches!(self, Self::Approved)
+    pub fn allows_automatic_execution(&self) -> bool {
+        matches!(self, Self::Automatic)
     }
 }
 
@@ -68,7 +68,7 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> GatewayResult<Self> {
         let burn_execution_mode =
-            BurnExecutionMode::from_env_value(&env_or("BURN_EXECUTION_MODE", "manual"))?;
+            BurnExecutionMode::from_env_value(&env_or("BURN_EXECUTION_MODE", "disabled"))?;
 
         let config = Self {
             host: env_or("HOST", "0.0.0.0"),
