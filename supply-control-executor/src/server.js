@@ -15,11 +15,44 @@ import {
   getAccount,
 } from '@solana/spl-token';
 
+loadDotenv();
+
 const PORT = Number(process.env.PORT || process.env.EXECUTOR_PORT || 8787);
 const DEFAULT_RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.devnet.solana.com';
 const EXECUTOR_TOKEN = process.env.PERAX_SUPPLY_CONTROL_EXECUTOR_TOKEN || '';
 const AUTHORITY_KEYPAIR_PATH = process.env.PERAX_AUTHORITY_KEYPAIR_PATH || '';
 const TRADING_COMPANY_AUTHORITY_KEYPAIR_PATH = process.env.TRADING_COMPANY_AUTHORITY_KEYPAIR_PATH || '';
+
+function loadDotenv() {
+  const envUrl = new URL('../.env', import.meta.url);
+  if (!fs.existsSync(envUrl)) {
+    return;
+  }
+
+  const lines = fs.readFileSync(envUrl, 'utf8').split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      continue;
+    }
+
+    const separatorIndex = trimmed.indexOf('=');
+    if (separatorIndex <= 0) {
+      continue;
+    }
+
+    const key = trimmed.slice(0, separatorIndex).trim();
+    let value = trimmed.slice(separatorIndex + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+
+    process.env[key] ??= value;
+  }
+}
 
 function jsonResponse(res, status, payload) {
   const body = JSON.stringify(payload);
