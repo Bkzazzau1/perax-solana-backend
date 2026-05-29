@@ -50,25 +50,19 @@ jobs:
       SOLANA_WS_URL: wss://api.devnet.solana.com
       PERAX_ANCHOR_WORKSPACE: /tmp/perax-contracts
 
-      # Real Pera-X devnet deployment records
       PERAX_PROGRAM_ID: FqEiSx5vujh2vi3yk12NaZMXhjMSaKovGUuzcKiAgshn
       PERAX_STATE_PDA: 8LNUe8ud9Lrtt1HmuS132YoGs5tBNEeWeviNJwWDkHWT
       PEX_MINT_ADDRESS: DnkAW3B1ckzW6eimgSBNPK3XTt83wMiZRETy8iF3gdsn
 
-      # Trading Company SPL token accounts
       TRADING_COMPANY_TOKEN_ACCOUNT: Wcx1HaNWZQmtfn1yfS3FWXv7AKSXV8ftciezTX3ufs8
       TRADING_COMPANY_REVENUE_TOKEN_ACCOUNT: E4JJoNkKhFq8Ev7XtJhuWrvdyNyWRzkwjsukgF9VbegA
-
-      # Backward-compatible config names
       TRADING_CO_TREASURY: Wcx1HaNWZQmtfn1yfS3FWXv7AKSXV8ftciezTX3ufs8
       TRADING_COMPANY_SECOND_WALLET: E4JJoNkKhFq8Ev7XtJhuWrvdyNyWRzkwjsukgF9VbegA
 
-      # PEX policy
       PEX_IMMEDIATE_BURN_PERCENTAGE: "10"
       PEX_MONTHLY_SELL_CAP_PERCENTAGE: "50"
       PEX_UNLOCK_REQUIRES_MANUAL_APPROVAL: "false"
 
-      # CI must never execute real burn transactions
       BURN_EXECUTION_MODE: disabled
       PERAX_SUPPLY_CONTROL_EXECUTOR_URL: http://127.0.0.1:8787/execute/market-condition-burn
       PERAX_SUPPLY_CONTROL_EXECUTOR_TOKEN: ci-only-disabled-token
@@ -115,6 +109,9 @@ jobs:
           exit 1
         env:
           PGPASSWORD: postgres
+
+      - name: Normalize formatting
+        run: cargo fmt --all
 
       - name: Cargo check
         run: cargo check
