@@ -1,0 +1,19 @@
+{
+  "name": "perax-supply-control-executor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Isolated automatic executor for Pera-X market-condition burn transactions.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "@solana/spl-token": "^0.4.13",
+    "@solana/web3.js": "^1.98.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
