@@ -16,9 +16,14 @@ use tracing::{debug, error, info};
 use uuid::Uuid;
 
 use crate::{
-    domains::{auth::middleware::AuthenticatedAccount, pricing},
+    domains::{
+        auth::middleware::AuthenticatedAccount,
+        pricing,
+        telecom::billing::{
+            credit_balance, debit_credits, log_provider_transaction, round_credits,
+        },
+    },
     error::{GatewayError, GatewayResult},
-    infra::cache,
     providers::TelnyxClient,
     state::AppState,
 };
@@ -62,6 +67,14 @@ pub struct VoiceCallRecord {
     pub ended_at: Option<DateTime<Utc>>,
     pub last_event_type: Option<String>,
     pub last_webhook_id: Option<String>,
+    pub service_code: Option<String>,
+    pub rate_per_minute: Option<f64>,
+    pub billed_seconds: Option<i32>,
+    pub billed_minutes: Option<f64>,
+    pub credits_charged: Option<f64>,
+    pub billing_status: Option<String>,
+    pub billing_ledger_id: Option<Uuid>,
+    pub billing_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -78,8 +91,6 @@ pub struct StartCallRequest {
     pub phone_number: String,
     pub destination: String,
     pub is_international: bool,
-    pub rate_per_minute: Option<f64>,
-    pub credit_balance: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -133,11 +144,6 @@ pub struct VoiceWebhookResponse {
 #[serde(rename_all = "camelCase")]
 pub struct EndCallRequest {
     pub call_id: String,
-    pub phone_number: String,
-    pub duration_seconds: i64,
-    pub rate_per_minute: Option<f64>,
-    pub credit_balance: f64,
-    pub is_international: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -162,9 +168,9 @@ pub async fn get_call(
 
 pub async fn start_call_session(
     State(state): State<AppState>,
+    account: AuthenticatedAccount,
     Json(payload): Json<StartCallRequest>,
 ) -> GatewayResult<Json<StartCallResponse>> {
-    let _client_rate_per_minute = payload.rate_per_minute;
     let service_code = if payload.is_international {
         "global_call"
     } else {
@@ -172,14 +178,15 @@ pub async fn start_call_session(
     };
     let price = pricing::get_utility_price(&state, service_code).await?;
     let rate_per_minute = price.credit_cost.max(0.0);
+    let balance = credit_balance(&state, account.account_id).await?;
     let estimated_minutes = if rate_per_minute > 0.0 {
-        (payload.credit_balance / rate_per_minute).floor() as i64
+        (balance / rate_per_minute).floor() as i64
     } else {
         0
     };
     let can_start = !payload.phone_number.trim().is_empty()
         && rate_per_minute > 0.0
-        && payload.credit_balance >= rate_per_minute;
+        && balance >= rate_per_minute;
 
     Ok(Json(StartCallResponse {
         call_id: format!("call_{}", Uuid::new_v4()),
@@ -191,7 +198,7 @@ pub async fn start_call_session(
         phone_number: payload.phone_number,
         destination: payload.destination,
         rate_per_minute,
-        credit_balance: payload.credit_balance,
+        credit_balance: balance,
         estimated_minutes,
         reserved_credits: if can_start { rate_per_minute } else { 0.0 },
         message: if can_start {
@@ -208,22 +215,17 @@ pub async fn start_call_session(
 
 pub async fn end_call_session(
     State(state): State<AppState>,
+    account: AuthenticatedAccount,
     Json(payload): Json<EndCallRequest>,
 ) -> GatewayResult<Json<EndCallResponse>> {
-    let _client_rate_per_minute = payload.rate_per_minute;
-    let duration_seconds = payload.duration_seconds.max(0);
-    let is_international = payload.is_international.unwrap_or(true);
-    let service_code = if is_international {
-        "global_call"
-    } else {
-        "local_call"
-    };
-    let price = pricing::get_utility_price(&state, service_code).await?;
-    let rate_per_minute = price.credit_cost.max(0.0);
-    let billed_minutes = (duration_seconds as f64 / 60.0).ceil().max(1.0);
-    let credit_cost = billed_minutes * rate_per_minute;
-    let remaining_credits = payload.credit_balance - credit_cost;
-    let confirmed = !payload.call_id.trim().is_empty() && remaining_credits >= 0.0;
+    let call = find_call(&state, &payload.call_id).await?;
+    if call.account_id != Some(account.account_id) {
+        return Err(GatewayError::Unauthorized);
+    }
+    let duration_seconds = i64::from(call.billed_seconds.unwrap_or(0).max(0));
+    let credit_cost = call.credits_charged.unwrap_or(0.0);
+    let remaining_credits = credit_balance(&state, account.account_id).await?;
+    let confirmed = call.billing_status.as_deref() == Some("posted");
 
     Ok(Json(EndCallResponse {
         call_id: payload.call_id,
@@ -236,12 +238,9 @@ pub async fn end_call_session(
         credit_cost: if confirmed { credit_cost } else { 0.0 },
         remaining_credits,
         message: if confirmed {
-            format!(
-                "Call to {} completed. Credits deducted using backend pricing.",
-                payload.phone_number
-            )
+            "Call completed and billed from Telnyx webhook duration.".to_string()
         } else {
-            "Call completion rejected. Insufficient Credits or invalid call reference.".to_string()
+            "Call is not finalized yet. Billing waits for Telnyx call.hangup webhook.".to_string()
         },
     }))
 }
@@ -265,14 +264,11 @@ pub async fn create_offer(
         "Processing real-time WebRTC signaling handshake"
     );
 
-    let user_redis_key = format!("client:balance:{}", account.account_id);
-    let current_credits = cache::get_credits(&state.cache, &user_redis_key).await?;
-
-    if let Some(balance) = current_credits {
-        if balance <= 0.0 {
-            return Err(GatewayError::InsufficientCredits);
-        }
-    } else {
+    let service_code = "global_call";
+    let price = pricing::get_utility_price(&state, service_code).await?;
+    let rate_per_minute = price.credit_cost.max(0.0);
+    let balance = credit_balance(&state, account.account_id).await?;
+    if balance < rate_per_minute {
         return Err(GatewayError::InsufficientCredits);
     }
 
@@ -292,10 +288,24 @@ pub async fn create_offer(
             &command_id,
         )
         .await?;
+    let status = response.status();
 
-    if !response.status().is_success() {
+    if !status.is_success() {
         let err_text = response.text().await.unwrap_or_default();
         error!(call_id = %call_id, account_id = %account.account_id, error = %err_text, "Telnyx outbound carrier connection rejected");
+        log_provider_transaction(
+            &state,
+            "create_call",
+            Some(account.account_id),
+            "telnyx_voice_call",
+            &call_id,
+            None,
+            None,
+            Some(status.as_u16()),
+            false,
+            Some(&err_text),
+        )
+        .await?;
         return Err(GatewayError::Upstream(format!(
             "Telnyx telephony infrastructure rejected execution: {}",
             err_text
@@ -323,7 +333,22 @@ pub async fn create_offer(
         telnyx_control_id.as_deref(),
         call_leg_id.as_deref(),
         call_session_id.as_deref(),
+        service_code,
+        rate_per_minute,
         Some(&resp_json),
+    )
+    .await?;
+    log_provider_transaction(
+        &state,
+        "create_call",
+        Some(account.account_id),
+        "telnyx_voice_call",
+        &call_id,
+        None,
+        Some(resp_json.clone()),
+        Some(status.as_u16()),
+        true,
+        None,
     )
     .await?;
 
@@ -427,11 +452,14 @@ pub async fn receive_voice_webhook(
 
 pub async fn speak_call(
     State(state): State<AppState>,
-    _account: AuthenticatedAccount,
+    account: AuthenticatedAccount,
     Path(id): Path<String>,
     Json(request): Json<SpeakCallRequest>,
 ) -> GatewayResult<Json<CallActionResponse>> {
     let call = find_call(&state, &id).await?;
+    if call.account_id != Some(account.account_id) {
+        return Err(GatewayError::Unauthorized);
+    }
     let call_control_id = call_control_id(&call)?;
     let text = request.text.trim();
     if text.is_empty() {
@@ -451,11 +479,14 @@ pub async fn speak_call(
 
 pub async fn record_call(
     State(state): State<AppState>,
-    _account: AuthenticatedAccount,
+    account: AuthenticatedAccount,
     Path(id): Path<String>,
     Json(request): Json<RecordCallRequest>,
 ) -> GatewayResult<Json<CallActionResponse>> {
     let call = find_call(&state, &id).await?;
+    if call.account_id != Some(account.account_id) {
+        return Err(GatewayError::Unauthorized);
+    }
     let call_control_id = call_control_id(&call)?;
     let payload = json!({
         "format": request.format.unwrap_or_else(|| "mp3".to_string()),
@@ -474,10 +505,13 @@ pub async fn record_call(
 
 pub async fn hangup_call(
     State(state): State<AppState>,
-    _account: AuthenticatedAccount,
+    account: AuthenticatedAccount,
     Path(id): Path<String>,
 ) -> GatewayResult<Json<CallActionResponse>> {
     let call = find_call(&state, &id).await?;
+    if call.account_id != Some(account.account_id) {
+        return Err(GatewayError::Unauthorized);
+    }
     let call_control_id = call_control_id(&call)?;
     let payload = json!({
         "command_id": format!("cmd_{}", Uuid::new_v4().simple()),
@@ -495,18 +529,46 @@ async fn post_call_action(
     let response = TelnyxClient::new(state)
         .call_action(call_control_id, action, &payload)
         .await?;
-    if !response.status().is_success() {
+    let status = response.status();
+    if !status.is_success() {
         let err_text = response.text().await.unwrap_or_default();
+        log_provider_transaction(
+            state,
+            action,
+            None,
+            "telnyx_voice_call",
+            call_id,
+            Some(payload),
+            None,
+            Some(status.as_u16()),
+            false,
+            Some(&err_text),
+        )
+        .await?;
         return Err(GatewayError::Upstream(format!(
             "Telnyx call action {action} failed: {err_text}"
         )));
     }
+    let provider_response: Value = response.json().await?;
+    log_provider_transaction(
+        state,
+        action,
+        None,
+        "telnyx_voice_call",
+        call_id,
+        Some(payload),
+        Some(provider_response.clone()),
+        Some(status.as_u16()),
+        true,
+        None,
+    )
+    .await?;
 
     Ok(Json(CallActionResponse {
         accepted: true,
         action: action.to_string(),
         call_id: call_id.to_string(),
-        provider_response: response.json().await?,
+        provider_response,
     }))
 }
 
@@ -533,6 +595,14 @@ async fn find_call(state: &AppState, id: &str) -> GatewayResult<VoiceCallRecord>
                ended_at,
                last_event_type,
                last_webhook_id,
+               service_code,
+               rate_per_minute::float8 as rate_per_minute,
+               billed_seconds,
+               billed_minutes::float8 as billed_minutes,
+               credits_charged::float8 as credits_charged,
+               billing_status,
+               billing_ledger_id,
+               billing_error,
                created_at,
                updated_at
         from telnyx_voice_calls
@@ -556,6 +626,8 @@ async fn upsert_outbound_call(
     call_control_id: Option<&str>,
     call_leg_id: Option<&str>,
     call_session_id: Option<&str>,
+    service_code: &str,
+    rate_per_minute: f64,
     raw_response: Option<&Value>,
 ) -> GatewayResult<()> {
     sqlx::query(
@@ -572,13 +644,22 @@ async fn upsert_outbound_call(
             from_number,
             to_number,
             status,
+            service_code,
+            rate_per_minute,
+            billing_status,
             last_raw_event
-        ) values ($1, $2, $3, $4, $5, $6, $7, 'outgoing', $8, $9, 'initiated', $10)
+        ) values ($1, $2, $3, $4, $5, $6, $7, 'outgoing', $8, $9, 'initiated', $10, $11, 'pending', $12)
         on conflict (call_id) do update
         set command_id = excluded.command_id,
             call_control_id = coalesce(excluded.call_control_id, telnyx_voice_calls.call_control_id),
             call_leg_id = coalesce(excluded.call_leg_id, telnyx_voice_calls.call_leg_id),
             call_session_id = coalesce(excluded.call_session_id, telnyx_voice_calls.call_session_id),
+            service_code = excluded.service_code,
+            rate_per_minute = excluded.rate_per_minute,
+            billing_status = case
+                when telnyx_voice_calls.billing_status = 'not_billed' then excluded.billing_status
+                else telnyx_voice_calls.billing_status
+            end,
             status = excluded.status,
             last_raw_event = coalesce(excluded.last_raw_event, telnyx_voice_calls.last_raw_event),
             updated_at = now()
@@ -593,9 +674,103 @@ async fn upsert_outbound_call(
     .bind(&state.config.telnyx_connection_id)
     .bind(from_number)
     .bind(to_number)
+    .bind(service_code)
+    .bind(rate_per_minute)
     .bind(raw_response)
     .execute(&state.db)
     .await?;
+
+    Ok(())
+}
+
+async fn finalize_call_billing(state: &AppState, call_id: &str) -> GatewayResult<()> {
+    let call = find_call(state, call_id).await?;
+    if call.billing_status.as_deref() == Some("posted") {
+        return Ok(());
+    }
+
+    let Some(account_id) = call.account_id else {
+        return Ok(());
+    };
+    let Some(rate_per_minute) = call.rate_per_minute else {
+        return Ok(());
+    };
+
+    let started_at = call.started_at.or(call.answered_at);
+    let ended_at = call.ended_at;
+    let Some(started_at) = started_at else {
+        return Ok(());
+    };
+    let Some(ended_at) = ended_at else {
+        return Ok(());
+    };
+
+    let duration_seconds = (ended_at - started_at).num_seconds().max(0) as i32;
+    let billed_minutes = ((duration_seconds as f64) / 60.0).ceil().max(1.0);
+    let credits_charged = round_credits(billed_minutes * rate_per_minute);
+    let source_reference = format!("telnyx_voice_call:{}", call.call_id);
+
+    match debit_credits(
+        state,
+        account_id,
+        credits_charged,
+        "telnyx_voice_call",
+        &source_reference,
+        "Telnyx voice call duration billing",
+        json!({
+            "callId": call.call_id,
+            "callControlId": call.call_control_id,
+            "durationSeconds": duration_seconds,
+            "billedMinutes": billed_minutes,
+            "ratePerMinute": rate_per_minute
+        }),
+    )
+    .await
+    {
+        Ok(debit) => {
+            sqlx::query(
+                r#"
+                update telnyx_voice_calls
+                set billed_seconds = $1,
+                    billed_minutes = $2,
+                    credits_charged = $3,
+                    billing_status = 'posted',
+                    billing_ledger_id = $4,
+                    billing_error = null,
+                    updated_at = now()
+                where call_id = $5
+                "#,
+            )
+            .bind(duration_seconds)
+            .bind(billed_minutes)
+            .bind(credits_charged)
+            .bind(debit.ledger_id)
+            .bind(&call.call_id)
+            .execute(&state.db)
+            .await?;
+        }
+        Err(err) => {
+            sqlx::query(
+                r#"
+                update telnyx_voice_calls
+                set billed_seconds = $1,
+                    billed_minutes = $2,
+                    credits_charged = $3,
+                    billing_status = 'failed',
+                    billing_error = $4,
+                    updated_at = now()
+                where call_id = $5
+                "#,
+            )
+            .bind(duration_seconds)
+            .bind(billed_minutes)
+            .bind(credits_charged)
+            .bind(err.to_string())
+            .bind(&call.call_id)
+            .execute(&state.db)
+            .await?;
+        }
+    }
 
     Ok(())
 }
@@ -698,6 +873,10 @@ async fn apply_voice_event_to_call(
     .execute(&state.db)
     .await?;
 
+    if event_type == "call.hangup" {
+        finalize_call_billing(state, identifier).await?;
+    }
+
     Ok(())
 }
 
@@ -724,7 +903,11 @@ fn parse_event_time(value: Option<&str>) -> Option<DateTime<Utc>> {
         .map(|value| value.with_timezone(&Utc))
 }
 
-fn verify_telnyx_webhook(state: &AppState, headers: &HeaderMap, body: &[u8]) -> GatewayResult<()> {
+pub(crate) fn verify_telnyx_webhook(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> GatewayResult<()> {
     let public_key = state.config.telnyx_webhook_public_key.trim();
     if !public_key.is_empty() {
         return verify_telnyx_ed25519(public_key, headers, body);
@@ -733,6 +916,13 @@ fn verify_telnyx_webhook(state: &AppState, headers: &HeaderMap, body: &[u8]) -> 
     let secret = state.config.telnyx_webhook_signing_secret.trim();
     if !secret.is_empty() {
         return verify_telnyx_hmac(secret, headers, body);
+    }
+
+    if telnyx_webhook_verification_required() {
+        return Err(GatewayError::Config(
+            "TELNYX_WEBHOOK_PUBLIC_KEY or TELNYX_WEBHOOK_SIGNING_SECRET is required in production"
+                .to_string(),
+        ));
     }
 
     Ok(())
@@ -819,4 +1009,15 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         .zip(b.iter())
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
+}
+
+fn telnyx_webhook_verification_required() -> bool {
+    std::env::var("APP_ENV")
+        .or_else(|_| std::env::var("RUST_ENV"))
+        .or_else(|_| std::env::var("ENV"))
+        .map(|value| {
+            let value = value.trim().to_lowercase();
+            value == "production" || value == "prod"
+        })
+        .unwrap_or(false)
 }

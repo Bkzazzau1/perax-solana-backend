@@ -553,9 +553,32 @@ async fn post_verified_payment(
             payment_intent_id,
             quote_reference,
             user_id,
-            credits_granted
-        ) values ($1, $2, $3, $4)
-        on conflict (payment_intent_id) do update
+            credits_granted,
+            account_id,
+            ledger_direction,
+            credit_delta,
+            balance_after,
+            source,
+            source_reference,
+            description
+        ) values (
+            $1,
+            $2,
+            $3,
+            $4,
+            case
+                when $3 ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                then $3::uuid
+                else null
+            end,
+            'credit',
+            $4,
+            null,
+            'payment',
+            $2,
+            'Verified payment credit grant'
+        )
+        on conflict (source, source_reference) where source is not null and source_reference is not null do update
         set credits_granted = credit_ledger.credits_granted
         returning id
         "#,

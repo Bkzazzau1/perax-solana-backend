@@ -7,9 +7,13 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
-    domains::auth::middleware::AuthenticatedAccount,
+    domains::{
+        auth::middleware::AuthenticatedAccount,
+        telecom::billing::{
+            credit_balance, debit_credits, log_provider_transaction, round_credits,
+        },
+    },
     error::{GatewayError, GatewayResult},
-    infra::cache,
     providers::TelnyxClient,
     state::AppState,
 };
@@ -33,7 +37,6 @@ pub struct NumberReserveRequest {
     pub country: String,
     pub phone_number: String,
     pub plan: String,
-    pub credit_balance: f64,
     pub number_type: Option<String>,
 }
 
@@ -251,13 +254,30 @@ pub async fn reserve_number_with_credits(
     } else {
         monthly_fee
     };
-    let credit_cost = setup_fee + subscription_cost;
-    let remaining_credits = payload.credit_balance - credit_cost;
+    let credit_cost = round_credits(setup_fee + subscription_cost);
+    let balance = credit_balance(&state, account.account_id).await?;
+    let remaining_credits = round_credits(balance - credit_cost);
     let confirmed = credit_cost > 0.0 && remaining_credits >= 0.0;
     let order_id = format!("num_order_{}", chrono::Utc::now().timestamp_millis());
     let next_renewal_at = chrono::Utc::now() + chrono::Duration::days(30 * recurring_months);
 
     if confirmed {
+        debit_credits(
+            &state,
+            account.account_id,
+            credit_cost,
+            "telnyx_number_reservation",
+            &order_id,
+            "Telnyx number reservation/subscription",
+            serde_json::json!({
+                "phoneNumber": phone_number,
+                "country": payload.country,
+                "plan": plan,
+                "setupFeeCredits": setup_fee,
+                "subscriptionCost": subscription_cost
+            }),
+        )
+        .await?;
         save_reserved_number(
             &state,
             account.account_id,
@@ -376,15 +396,16 @@ pub async fn reactivate_number_subscription(
         ));
     }
 
-    let cache_key = format!("client:balance:{}", account.account_id);
-    let current_credits = cache::get_credits(&state.cache, &cache_key).await?;
-
-    match current_credits {
-        Some(balance) if balance >= monthly_fee => {
-            cache::increment_credits(&state.cache, &cache_key, -monthly_fee).await?;
-        }
-        _ => return Err(GatewayError::InsufficientCredits),
-    }
+    debit_credits(
+        &state,
+        account.account_id,
+        monthly_fee,
+        "telnyx_number_reactivation",
+        &format!("telnyx_number_reactivation:{number_id}"),
+        "Telnyx number subscription reactivation",
+        serde_json::json!({ "numberId": number_id, "phoneNumber": record.phone_number }),
+    )
+    .await?;
 
     let next_renewal_at = chrono::Utc::now() + chrono::Duration::days(30);
     let updated = sqlx::query_as::<_, NumberSubscriptionRecord>(
@@ -422,6 +443,23 @@ pub async fn reactivate_number_subscription(
 pub async fn process_due_number_renewals(
     State(state): State<AppState>,
 ) -> GatewayResult<Json<NumberRenewalResponse>> {
+    Ok(Json(process_due_number_renewals_inner(&state).await?))
+}
+
+pub fn spawn_number_renewal_worker(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = process_due_number_renewals_inner(&state).await {
+                tracing::error!(error = %err, "Telnyx number renewal worker failed");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
+    });
+}
+
+async fn process_due_number_renewals_inner(
+    state: &AppState,
+) -> GatewayResult<NumberRenewalResponse> {
     let candidates = sqlx::query_as::<_, NumberRenewalCandidate>(
         r#"
         select id,
@@ -448,7 +486,7 @@ pub async fn process_due_number_renewals(
         let monthly_fee = candidate.monthly_fee_credits.unwrap_or(0.0);
 
         if monthly_fee <= 0.0 {
-            mark_number_past_due(&state, candidate.id).await?;
+            mark_number_past_due(state, candidate.id).await?;
             past_due += 1;
             items.push(NumberRenewalItem {
                 id: candidate.id,
@@ -462,7 +500,7 @@ pub async fn process_due_number_renewals(
         }
 
         let Some(account_id) = candidate.account_id else {
-            mark_number_past_due(&state, candidate.id).await?;
+            mark_number_past_due(state, candidate.id).await?;
             past_due += 1;
             items.push(NumberRenewalItem {
                 id: candidate.id,
@@ -475,12 +513,22 @@ pub async fn process_due_number_renewals(
             continue;
         };
 
-        let cache_key = format!("client:balance:{}", account_id);
-        let current_credits = cache::get_credits(&state.cache, &cache_key).await?;
-
-        match current_credits {
-            Some(balance) if balance >= monthly_fee => {
-                cache::increment_credits(&state.cache, &cache_key, -monthly_fee).await?;
+        match debit_credits(
+            state,
+            account_id,
+            monthly_fee,
+            "telnyx_number_renewal",
+            &format!(
+                "telnyx_number_renewal:{}:{}",
+                candidate.id,
+                chrono::Utc::now().date_naive()
+            ),
+            "Telnyx number monthly subscription renewal",
+            serde_json::json!({ "numberId": candidate.id, "phoneNumber": candidate.phone_number }),
+        )
+        .await
+        {
+            Ok(_) => {
                 let new_renewal_at = chrono::Utc::now() + chrono::Duration::days(30);
                 sqlx::query(
                     r#"
@@ -508,7 +556,7 @@ pub async fn process_due_number_renewals(
                 });
             }
             _ => {
-                mark_number_past_due(&state, candidate.id).await?;
+                mark_number_past_due(state, candidate.id).await?;
                 past_due += 1;
                 items.push(NumberRenewalItem {
                     id: candidate.id,
@@ -522,12 +570,12 @@ pub async fn process_due_number_renewals(
         }
     }
 
-    Ok(Json(NumberRenewalResponse {
+    Ok(NumberRenewalResponse {
         processed: items.len(),
         renewed,
         past_due,
         items,
-    }))
+    })
 }
 
 pub async fn purchase_number(
@@ -536,29 +584,57 @@ pub async fn purchase_number(
     Json(payload): Json<NumberBuyRequest>,
 ) -> GatewayResult<Json<ProvisioningResponse>> {
     let phone_number = normalize_phone_number(&payload.phone_number)?;
-    let user_cache_key = format!("client:balance:{}", account.account_id);
-
-    let current_credits = cache::get_credits(&state.cache, &user_cache_key).await?;
-    match current_credits {
-        Some(balance) if balance >= NUMBER_SETUP_COST => {
-            cache::increment_credits(&state.cache, &user_cache_key, -NUMBER_SETUP_COST).await?;
-        }
-        _ => return Err(GatewayError::InsufficientCredits),
-    }
+    let source_reference = format!("telnyx_number_order:{}", Uuid::new_v4().simple());
+    debit_credits(
+        &state,
+        account.account_id,
+        NUMBER_SETUP_COST,
+        "telnyx_number_order",
+        &source_reference,
+        "Telnyx number purchase",
+        serde_json::json!({ "phoneNumber": phone_number }),
+    )
+    .await?;
 
     let response = TelnyxClient::new(&state)
         .order_number(&phone_number)
         .await?;
+    let http_status = response.status();
 
-    if !response.status().is_success() {
+    if !http_status.is_success() {
         let err_text = response.text().await.unwrap_or_default();
-        cache::increment_credits(&state.cache, &user_cache_key, NUMBER_SETUP_COST).await?;
+        log_provider_transaction(
+            &state,
+            "order_number",
+            Some(account.account_id),
+            "telnyx_number_order",
+            &source_reference,
+            None,
+            None,
+            Some(http_status.as_u16()),
+            false,
+            Some(&err_text),
+        )
+        .await?;
         return Err(GatewayError::Upstream(format!(
             "Telnyx number provisioning failed: {err_text}"
         )));
     }
 
     let resp_json: Value = response.json().await?;
+    log_provider_transaction(
+        &state,
+        "order_number",
+        Some(account.account_id),
+        "telnyx_number_order",
+        &source_reference,
+        None,
+        Some(resp_json.clone()),
+        Some(http_status.as_u16()),
+        true,
+        None,
+    )
+    .await?;
     let order_id = resp_json["data"]["id"]
         .as_str()
         .unwrap_or("unknown_order")

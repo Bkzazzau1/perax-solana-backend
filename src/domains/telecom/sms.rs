@@ -1,16 +1,24 @@
 // src/domains/telecom/sms.rs
 use axum::{
     Json,
+    body::Bytes,
     extract::{Query, State},
+    http::HeaderMap,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
-    domains::{auth::middleware::AuthenticatedAccount, pricing},
+    domains::{
+        auth::middleware::AuthenticatedAccount,
+        pricing,
+        telecom::{
+            billing::{debit_credits, log_provider_transaction, round_credits},
+            voice::verify_telnyx_webhook,
+        },
+    },
     error::{GatewayError, GatewayResult},
-    infra::cache,
     providers::TelnyxClient,
     state::AppState,
 };
@@ -28,6 +36,7 @@ pub struct SmsResponse {
     pub routed: bool,
     pub parts_billed: usize,
     pub credits_deducted: f64,
+    pub balance_after: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,17 +100,23 @@ pub async fn send_sms(
     let parts_billed = ((body_len as f64) / 160.0).ceil() as usize;
     let sms_price = pricing::get_utility_price(&state, "sms_outbound").await?;
     let cost_per_segment = sms_price.credit_cost;
-    let total_sms_cost = (parts_billed as f64) * cost_per_segment;
-
-    let user_redis_key = format!("client:balance:{}", account.account_id);
-    let current_credits = cache::get_credits(&state.cache, &user_redis_key).await?;
-
-    match current_credits {
-        Some(balance) if balance >= total_sms_cost => {
-            cache::increment_credits(&state.cache, &user_redis_key, -total_sms_cost).await?;
-        }
-        _ => return Err(GatewayError::InsufficientCredits),
-    };
+    let total_sms_cost = round_credits((parts_billed as f64) * cost_per_segment);
+    let source_reference = format!("sms_{}", Uuid::new_v4().simple());
+    let debit = debit_credits(
+        &state,
+        account.account_id,
+        total_sms_cost,
+        "telnyx_sms",
+        &source_reference,
+        "Outbound Telnyx SMS",
+        serde_json::json!({
+            "to": request.to,
+            "from": request.from,
+            "partsBilled": parts_billed,
+            "costPerSegment": cost_per_segment
+        }),
+    )
+    .await?;
 
     tracing::debug!(
         account_id = %account.account_id,
@@ -114,12 +129,24 @@ pub async fn send_sms(
     let response = TelnyxClient::new(&state)
         .send_sms(&request.to, &request.from, &request.body)
         .await?;
+    let status = response.status();
 
-    if !response.status().is_success() {
+    if !status.is_success() {
         let err_text = response.text().await.unwrap_or_default();
         tracing::error!(account_id = %account.account_id, error = %err_text, "Telnyx SMS gateway delivery rejected");
-
-        cache::increment_credits(&state.cache, &user_redis_key, total_sms_cost).await?;
+        log_provider_transaction(
+            &state,
+            "send_sms",
+            Some(account.account_id),
+            "telnyx_sms",
+            &source_reference,
+            None,
+            None,
+            Some(status.as_u16()),
+            false,
+            Some(&err_text),
+        )
+        .await?;
 
         return Err(GatewayError::Upstream(format!(
             "Telnyx messaging infrastructure failure: {err_text}"
@@ -131,19 +158,38 @@ pub async fn send_sms(
         .as_str()
         .unwrap_or("unknown_carrier_id")
         .to_string();
+    log_provider_transaction(
+        &state,
+        "send_sms",
+        Some(account.account_id),
+        "telnyx_sms",
+        &source_reference,
+        None,
+        Some(resp_json.clone()),
+        Some(status.as_u16()),
+        true,
+        None,
+    )
+    .await?;
 
     Ok(Json(SmsResponse {
         message_id,
         routed: true,
         parts_billed,
         credits_deducted: total_sms_cost,
+        balance_after: debit.balance_after,
     }))
 }
 
 pub async fn receive_inbound_sms(
     State(state): State<AppState>,
-    Json(payload): Json<InboundSmsWebhook>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> GatewayResult<Json<InboundSmsWebhookResponse>> {
+    verify_telnyx_webhook(&state, &headers, &body)?;
+    let payload: InboundSmsWebhook = serde_json::from_slice(&body).map_err(|_| {
+        GatewayError::Upstream("Telnyx SMS webhook body is invalid JSON".to_string())
+    })?;
     let phone_number = extract_to_number(&payload)?;
     let sender = extract_from_number(&payload)?;
     let body = extract_body(&payload)?;
