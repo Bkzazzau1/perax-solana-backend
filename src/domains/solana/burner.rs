@@ -88,12 +88,13 @@ async fn inspect_daily_realized_burn_schedule(state: &AppState) -> Result<(), Ga
         mark_burn_submitted(state, burn.id).await?;
 
         match execute_contract_burn(state, &params).await {
-            Ok(signature) => {
-                mark_burn_executed(state, burn.id, &signature).await?;
+            Ok(result) => {
+                mark_burn_executed(state, burn.id, &result.signature, &result.burn_record).await?;
 
                 info!(
                     burn_id = %burn.id,
-                    signature = %signature,
+                    signature = %result.signature,
+                    burn_record = %result.burn_record,
                     "Automatic daily market-condition burn executed and recorded."
                 );
             }
@@ -126,6 +127,12 @@ struct ContractBurnParams {
     burn_rate_bps: u16,
     market_health_score: u8,
     observed_at: i64,
+}
+
+#[derive(Debug)]
+struct ContractBurnResult {
+    signature: String,
+    burn_record: String,
 }
 
 impl ContractBurnParams {
@@ -175,7 +182,7 @@ impl ContractBurnParams {
 async fn execute_contract_burn(
     state: &AppState,
     params: &ContractBurnParams,
-) -> Result<String, GatewayError> {
+) -> Result<ContractBurnResult, GatewayError> {
     let executor_url = env::var("PERAX_SUPPLY_CONTROL_EXECUTOR_URL")
         .or_else(|_| env::var("PERAX_BURN_EXECUTOR_URL"))
         .map(|value| value.trim().to_string())
@@ -221,7 +228,8 @@ async fn execute_contract_burn(
         )));
     }
 
-    body.get("signature")
+    let signature = body
+        .get("signature")
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -230,7 +238,24 @@ async fn execute_contract_burn(
             GatewayError::Upstream(
                 "supply-control executor response must include signature".to_string(),
             )
-        })
+        })?;
+
+    let burn_record = body
+        .get("burnRecord")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            GatewayError::Upstream(
+                "supply-control executor response must include burnRecord".to_string(),
+            )
+        })?;
+
+    Ok(ContractBurnResult {
+        signature,
+        burn_record,
+    })
 }
 
 async fn mark_burn_submitted(state: &AppState, burn_id: Uuid) -> Result<(), GatewayError> {
@@ -252,6 +277,7 @@ async fn mark_burn_executed(
     state: &AppState,
     burn_id: Uuid,
     signature: &str,
+    burn_record: &str,
 ) -> Result<(), GatewayError> {
     sqlx::query(
         r#"
@@ -260,6 +286,7 @@ async fn mark_burn_executed(
             burn_status = 'executed',
             onchain_tx_signature = $2,
             burn_tx_signature = $2,
+            onchain_burn_record = $3,
             executed_at = now(),
             execution_error = null,
             updated_at = now()
@@ -268,6 +295,7 @@ async fn mark_burn_executed(
     )
     .bind(burn_id)
     .bind(signature)
+    .bind(burn_record)
     .execute(&state.db)
     .await?;
 

@@ -12,7 +12,7 @@ import {
 } from '@solana/web3.js';
 import {
   TOKEN_PROGRAM_ID,
-  getAssociatedTokenAddressSync,
+  getAccount,
 } from '@solana/spl-token';
 
 const PORT = Number(process.env.PORT || process.env.EXECUTOR_PORT || 8787);
@@ -170,14 +170,23 @@ async function executeBurn(payload) {
   }
 
   const tradingCompanyRevenueTokenAccount = new PublicKey(payload.tradingCompanyRevenueTokenAccount);
-  const expectedRevenueAta = getAssociatedTokenAddressSync(
-    tokenMint,
-    tradingCompanyAuthority.publicKey,
-    false,
+  const revenueTokenAccountState = await getAccount(
+    connection,
+    tradingCompanyRevenueTokenAccount,
+    'confirmed',
     TOKEN_PROGRAM_ID,
   );
-  if (!tradingCompanyRevenueTokenAccount.equals(expectedRevenueAta)) {
-    throw new Error('tradingCompanyRevenueTokenAccount must be the ATA owned by trading company authority for PEX mint');
+
+  if (!revenueTokenAccountState.owner.equals(tradingCompanyAuthority.publicKey)) {
+    throw new Error('tradingCompanyRevenueTokenAccount owner does not match trading company authority');
+  }
+
+  if (!revenueTokenAccountState.mint.equals(tokenMint)) {
+    throw new Error('tradingCompanyRevenueTokenAccount mint does not match PEX mint');
+  }
+
+  if (revenueTokenAccountState.amount < BigInt(payload.amountBaseUnits)) {
+    throw new Error('tradingCompanyRevenueTokenAccount balance is lower than requested burn amount');
   }
 
   const burnRecordPda = deriveBurnRecordPda(programId, payload.decisionIdHex);
@@ -208,6 +217,12 @@ async function executeBurn(payload) {
     [authority, tradingCompanyAuthority],
     { commitment: 'confirmed' },
   );
+
+  const burnRecordInfo = await connection.getAccountInfo(burnRecordPda, 'confirmed');
+
+  if (!burnRecordInfo) {
+    throw new Error('BurnExecutionRecord was not created after transaction confirmation');
+  }
 
   return {
     signature,
