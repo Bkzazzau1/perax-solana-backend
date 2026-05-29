@@ -85,6 +85,8 @@ async fn inspect_daily_realized_burn_schedule(state: &AppState) -> Result<(), Ga
             continue;
         }
 
+        mark_burn_submitted(state, burn.id).await?;
+
         match execute_contract_burn(state, &params).await {
             Ok(signature) => {
                 mark_burn_executed(state, burn.id, &signature).await?;
@@ -96,7 +98,7 @@ async fn inspect_daily_realized_burn_schedule(state: &AppState) -> Result<(), Ga
                 );
             }
             Err(err) => {
-                mark_burn_failed(state, burn.id, &err.to_string()).await?;
+                mark_burn_failed_from_submitted(state, burn.id, &err.to_string()).await?;
                 return Err(err);
             }
         }
@@ -231,6 +233,21 @@ async fn execute_contract_burn(
         })
 }
 
+async fn mark_burn_submitted(state: &AppState, burn_id: Uuid) -> Result<(), GatewayError> {
+    sqlx::query(
+        r#"
+        update pex_daily_realized_burns
+        set burn_status = 'submitted', execution_error = null, updated_at = now()
+        where id = $1 and burn_status = 'scheduled'
+        "#,
+    )
+    .bind(burn_id)
+    .execute(&state.db)
+    .await?;
+
+    Ok(())
+}
+
 async fn mark_burn_executed(
     state: &AppState,
     burn_id: Uuid,
@@ -242,10 +259,11 @@ async fn mark_burn_executed(
         set
             burn_status = 'executed',
             onchain_tx_signature = $2,
+            burn_tx_signature = $2,
             executed_at = now(),
             execution_error = null,
             updated_at = now()
-        where id = $1 and burn_status = 'scheduled'
+        where id = $1 and burn_status = 'submitted'
         "#,
     )
     .bind(burn_id)
@@ -269,6 +287,29 @@ async fn mark_burn_failed(
             execution_error = $2,
             updated_at = now()
         where id = $1 and burn_status = 'scheduled'
+        "#,
+    )
+    .bind(burn_id)
+    .bind(reason)
+    .execute(&state.db)
+    .await?;
+
+    Ok(())
+}
+
+async fn mark_burn_failed_from_submitted(
+    state: &AppState,
+    burn_id: Uuid,
+    reason: &str,
+) -> Result<(), GatewayError> {
+    sqlx::query(
+        r#"
+        update pex_daily_realized_burns
+        set
+            burn_status = 'failed',
+            execution_error = $2,
+            updated_at = now()
+        where id = $1 and burn_status = 'submitted'
         "#,
     )
     .bind(burn_id)
