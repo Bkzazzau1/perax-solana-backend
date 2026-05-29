@@ -9,14 +9,17 @@ use crate::{error::GatewayError, state::AppState};
 
 pub fn spawn_daily_burner(state: AppState) {
     tokio::spawn(async move {
+        let interval = daily_burner_interval();
+
         info!(
             revenue_account = %state.config.trading_company_second_wallet,
             burn_execution_mode = %state.config.burn_execution_mode.as_str(),
+            interval_seconds = %interval.as_secs(),
             "Starting PEX automatic system-controlled daily burn worker"
         );
 
         loop {
-            tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
+            tokio::time::sleep(interval).await;
 
             info!("Checking automatic daily realized-revenue burn schedule...");
 
@@ -28,6 +31,15 @@ pub fn spawn_daily_burner(state: AppState) {
             }
         }
     });
+}
+
+fn daily_burner_interval() -> Duration {
+    env::var("PEX_BURNER_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(24 * 60 * 60))
 }
 
 async fn inspect_daily_realized_burn_schedule(state: &AppState) -> Result<(), GatewayError> {
