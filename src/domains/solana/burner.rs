@@ -12,18 +12,18 @@ pub fn spawn_daily_burner(state: AppState) {
         info!(
             revenue_account = %state.config.trading_company_second_wallet,
             burn_execution_mode = %state.config.burn_execution_mode.as_str(),
-            "Starting PEX system-controlled daily burn worker"
+            "Starting PEX automatic system-controlled daily burn worker"
         );
 
         loop {
             tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
 
-            info!("Checking system-controlled daily realized-revenue burn schedule...");
+            info!("Checking automatic daily realized-revenue burn schedule...");
 
             if let Err(err) = inspect_daily_realized_burn_schedule(&state).await {
                 error!(
                     error = %err,
-                    "Failed to inspect daily realized-revenue burn schedule"
+                    "Failed to inspect automatic daily realized-revenue burn schedule"
                 );
             }
         }
@@ -77,11 +77,11 @@ async fn inspect_daily_realized_burn_schedule(state: &AppState) -> Result<(), Ga
             market_health_score = %params.market_health_score,
             observed_at = %params.observed_at,
             burn_execution_mode = %state.config.burn_execution_mode.as_str(),
-            "Daily burn is ready for execute_market_condition_burn smart-contract execution."
+            "Daily burn is ready for automatic execute_market_condition_burn smart-contract execution."
         );
 
-        // Manual mode means: prepare and log only. No on-chain execution.
-        if !state.config.burn_execution_mode.allows_approved_execution() {
+        // Disabled mode means: prepare and log only. No on-chain execution.
+        if !state.config.burn_execution_mode.allows_automatic_execution() {
             continue;
         }
 
@@ -94,7 +94,7 @@ async fn inspect_daily_realized_burn_schedule(state: &AppState) -> Result<(), Ga
                 info!(
                     burn_id = %burn.id,
                     signature = %signature,
-                    "Daily market-condition burn executed and recorded."
+                    "Automatic daily market-condition burn executed and recorded."
                 );
             }
             Err(err) => {
@@ -183,7 +183,7 @@ async fn execute_contract_burn(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             GatewayError::Config(
-                "PERAX_SUPPLY_CONTROL_EXECUTOR_URL is required when BURN_EXECUTION_MODE=approved"
+                "PERAX_SUPPLY_CONTROL_EXECUTOR_URL is required when BURN_EXECUTION_MODE=automatic"
                     .to_string(),
             )
         })?;
