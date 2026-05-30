@@ -58,9 +58,14 @@ async fn provider_status(State(state): State<AppState>) -> Json<ProviderStatusRe
             ],
         },
         telnyx: ProviderConnectionStatus {
-            configured: configured(&[&config.telnyx_api_key, &config.telnyx_webhook_public_key]),
+            configured: !config.telnyx_api_key.trim().is_empty()
+                && (!config.telnyx_webhook_public_key.trim().is_empty()
+                    || !config.telnyx_webhook_signing_secret.trim().is_empty()),
             base_url: Some(config.telnyx_base_url.clone()),
-            required_env: vec!["TELNYX_API_KEY", "TELNYX_WEBHOOK_PUBLIC_KEY"],
+            required_env: vec![
+                "TELNYX_API_KEY",
+                "TELNYX_WEBHOOK_PUBLIC_KEY or TELNYX_WEBHOOK_SIGNING_SECRET",
+            ],
         },
         payscribe: ProviderConnectionStatus {
             configured: configured(&[
@@ -306,6 +311,123 @@ impl<'a> TelnyxClient<'a> {
             .http
             .post(format!(
                 "{}/v2/number_orders",
+                self.state.config.telnyx_base_url
+            ))
+            .bearer_auth(&self.state.config.telnyx_api_key)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(GatewayError::Http)
+    }
+
+    pub async fn retrieve_number_messaging(&self, identifier: &str) -> GatewayResult<Response> {
+        require_config("TELNYX_API_KEY", &self.state.config.telnyx_api_key)?;
+        let identifier = identifier.trim();
+        if identifier.is_empty() {
+            return Err(GatewayError::Upstream(
+                "Telnyx phone number identifier is required".to_string(),
+            ));
+        }
+
+        self.state
+            .http
+            .get(format!(
+                "{}/v2/phone_numbers/{identifier}/messaging",
+                self.state.config.telnyx_base_url
+            ))
+            .bearer_auth(&self.state.config.telnyx_api_key)
+            .send()
+            .await
+            .map_err(GatewayError::Http)
+    }
+
+    pub async fn update_number_messaging_profile(
+        &self,
+        identifier: &str,
+        messaging_profile_id: &str,
+    ) -> GatewayResult<Response> {
+        require_config("TELNYX_API_KEY", &self.state.config.telnyx_api_key)?;
+        let identifier = identifier.trim();
+        if identifier.is_empty() {
+            return Err(GatewayError::Upstream(
+                "Telnyx phone number identifier is required".to_string(),
+            ));
+        }
+        let payload = json!({ "messaging_profile_id": messaging_profile_id });
+
+        self.state
+            .http
+            .patch(format!(
+                "{}/v2/phone_numbers/{identifier}/messaging",
+                self.state.config.telnyx_base_url
+            ))
+            .bearer_auth(&self.state.config.telnyx_api_key)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(GatewayError::Http)
+    }
+
+    pub async fn release_phone_number(&self, identifier: &str) -> GatewayResult<Response> {
+        require_config("TELNYX_API_KEY", &self.state.config.telnyx_api_key)?;
+        let identifier = identifier.trim();
+        if identifier.is_empty() {
+            return Err(GatewayError::Upstream(
+                "Telnyx phone number identifier is required".to_string(),
+            ));
+        }
+
+        self.state
+            .http
+            .delete(format!(
+                "{}/v2/phone_numbers/{identifier}",
+                self.state.config.telnyx_base_url
+            ))
+            .bearer_auth(&self.state.config.telnyx_api_key)
+            .send()
+            .await
+            .map_err(GatewayError::Http)
+    }
+
+    pub async fn sync_cdr_usage_report(
+        &self,
+        start_time: &str,
+        end_time: &str,
+    ) -> GatewayResult<Response> {
+        require_config("TELNYX_API_KEY", &self.state.config.telnyx_api_key)?;
+        let payload = json!({
+            "start_time": start_time,
+            "end_time": end_time
+        });
+
+        self.state
+            .http
+            .post(format!(
+                "{}/v2/reports/cdr_usage_reports/sync",
+                self.state.config.telnyx_base_url
+            ))
+            .bearer_auth(&self.state.config.telnyx_api_key)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(GatewayError::Http)
+    }
+
+    pub async fn sync_mdr_usage_report(
+        &self,
+        start_time: &str,
+        end_time: &str,
+    ) -> GatewayResult<Response> {
+        require_config("TELNYX_API_KEY", &self.state.config.telnyx_api_key)?;
+        let payload = json!({
+            "start_time": start_time,
+            "end_time": end_time
+        });
+
+        self.state
+            .http
+            .post(format!(
+                "{}/v2/reports/mdr_usage_reports/sync",
                 self.state.config.telnyx_base_url
             ))
             .bearer_auth(&self.state.config.telnyx_api_key)

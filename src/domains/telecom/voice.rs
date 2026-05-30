@@ -854,10 +854,11 @@ async fn finalize_call_billing(state: &AppState, call_id: &str) -> GatewayResult
                     billing_error = null,
                     estimated_usd_cost = $5,
                     provider_cost_currency = $6,
-                    margin_credits = $7,
-                    margin_usd = $8,
+                    provider_cost_source = $7,
+                    margin_credits = $8,
+                    margin_usd = $9,
                     updated_at = now()
-                where call_id = $9
+                where call_id = $10
                 "#,
             )
             .bind(duration_seconds)
@@ -866,6 +867,7 @@ async fn finalize_call_billing(state: &AppState, call_id: &str) -> GatewayResult
             .bind(debit.ledger_id)
             .bind(economics.estimated_usd_cost)
             .bind(&economics.provider_cost_currency)
+            .bind(&economics.provider_cost_source)
             .bind(economics.margin_credits)
             .bind(economics.margin_usd)
             .bind(&call.call_id)

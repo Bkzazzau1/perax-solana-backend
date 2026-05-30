@@ -5,7 +5,7 @@ use axum::{
 };
 
 use crate::{
-    domains::telecom::{inventory, sms, voice},
+    domains::telecom::{inventory, sms, usage_reports, voice},
     state::AppState,
 };
 
@@ -27,6 +27,14 @@ pub fn router() -> Router<AppState> {
         .route("/telecom/sms/inbound", post(sms::receive_inbound_sms))
         .route("/telecom/sms/inbox", get(sms::get_sms_inbox))
         .route(
+            "/telecom/usage-reports/cdr/sync",
+            post(usage_reports::sync_cdr_usage_report),
+        )
+        .route(
+            "/telecom/usage-reports/mdr/sync",
+            post(usage_reports::sync_mdr_usage_report),
+        )
+        .route(
             "/telecom/numbers/search",
             get(inventory::search_global_numbers),
         )
@@ -38,6 +46,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/telecom/numbers/{id}/cancel",
             post(inventory::cancel_number_subscription),
+        )
+        .route(
+            "/telecom/numbers/{id}/sync",
+            post(inventory::sync_number_provider_status),
         )
         .route(
             "/telecom/numbers/{id}/reactivate",

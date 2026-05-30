@@ -17,7 +17,7 @@ use crate::{
             billing::{
                 credit_credits, debit_credits, estimate_telnyx_economics, log_provider_transaction,
                 log_provider_transaction_with_economics, round_credits,
-                telnyx_sms_estimated_usd_cost,
+                telnyx_economics_with_cost_source, telnyx_sms_estimated_usd_cost,
             },
             voice::verify_telnyx_webhook,
         },
@@ -77,9 +77,11 @@ pub struct InboundSmsMessage {
 #[serde(rename_all = "camelCase")]
 pub struct InboundSmsWebhookResponse {
     pub accepted: bool,
-    pub message_id: Uuid,
-    pub phone_number: String,
-    pub sender: String,
+    pub event_type: Option<String>,
+    pub message_id: Option<Uuid>,
+    pub provider_message_id: Option<String>,
+    pub phone_number: Option<String>,
+    pub sender: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -211,6 +213,19 @@ pub async fn receive_inbound_sms(
     let payload: InboundSmsWebhook = serde_json::from_slice(&body).map_err(|_| {
         GatewayError::Upstream("Telnyx SMS webhook body is invalid JSON".to_string())
     })?;
+    let event_type = extract_event_type(&payload);
+    if event_type.as_deref() == Some("message.finalized") {
+        let provider_message_id = reconcile_finalized_message_cost(&state, &payload).await?;
+        return Ok(Json(InboundSmsWebhookResponse {
+            accepted: true,
+            event_type,
+            message_id: None,
+            provider_message_id: Some(provider_message_id),
+            phone_number: None,
+            sender: None,
+        }));
+    }
+
     let phone_number = extract_to_number(&payload)?;
     let sender = extract_from_number(&payload)?;
     let body = extract_body(&payload)?;
@@ -243,9 +258,11 @@ pub async fn receive_inbound_sms(
 
     Ok(Json(InboundSmsWebhookResponse {
         accepted: true,
-        message_id: record.id,
-        phone_number: record.phone_number,
-        sender: record.sender,
+        event_type,
+        message_id: Some(record.id),
+        provider_message_id: record.provider_message_id,
+        phone_number: Some(record.phone_number),
+        sender: Some(record.sender),
     }))
 }
 
@@ -383,6 +400,178 @@ fn extract_provider_message_id(payload: &InboundSmsWebhook) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
         })
+}
+
+fn extract_event_type(payload: &InboundSmsWebhook) -> Option<String> {
+    payload
+        .data
+        .as_ref()
+        .and_then(|data| data.get("event_type"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .data
+                .as_ref()
+                .and_then(|data| data.get("type"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string)
+}
+
+async fn reconcile_finalized_message_cost(
+    state: &AppState,
+    payload: &InboundSmsWebhook,
+) -> GatewayResult<String> {
+    let provider_message_id = extract_provider_message_id(payload).ok_or_else(|| {
+        GatewayError::Upstream("message.finalized webhook missing provider message id".to_string())
+    })?;
+    let (provider_cost, provider_currency) = extract_finalized_cost(payload)?;
+    let cost_breakdown = extract_finalized_cost_breakdown(payload);
+    let credits_charged = sqlx::query_scalar::<_, Option<f64>>(
+        r#"
+        select credits_charged::double precision
+        from provider_transactions
+        where provider = 'telnyx'
+          and provider_action = 'send_sms'
+          and success = true
+          and response_payload #>> '{data,id}' = $1
+        order by created_at desc
+        limit 1
+        "#,
+    )
+    .bind(&provider_message_id)
+    .fetch_optional(&state.db)
+    .await?
+    .flatten()
+    .unwrap_or(0.0);
+    let economics = telnyx_economics_with_cost_source(
+        credits_charged,
+        provider_cost,
+        &provider_currency,
+        "message.finalized",
+    );
+    let provider_payload = serde_json::to_value(&payload.data).unwrap_or(Value::Null);
+
+    sqlx::query(
+        r#"
+        update provider_transactions
+        set estimated_usd_cost = $1,
+            provider_cost_currency = $2,
+            provider_cost_source = $3,
+            provider_carrier_fee_usd = $4,
+            provider_carrier_fee_currency = $5,
+            provider_rate_usd = $6,
+            provider_rate_currency = $7,
+            margin_credits = $8,
+            margin_usd = $9,
+            response_payload = jsonb_set(
+                coalesce(response_payload, '{}'::jsonb),
+                '{finalizedWebhook}',
+                $10,
+                true
+            )
+        where provider = 'telnyx'
+          and provider_action = 'send_sms'
+          and success = true
+          and response_payload #>> '{data,id}' = $11
+        "#,
+    )
+    .bind(economics.estimated_usd_cost)
+    .bind(&economics.provider_cost_currency)
+    .bind(&economics.provider_cost_source)
+    .bind(cost_breakdown.carrier_fee_amount)
+    .bind(cost_breakdown.carrier_fee_currency)
+    .bind(cost_breakdown.rate_amount)
+    .bind(cost_breakdown.rate_currency)
+    .bind(economics.margin_credits)
+    .bind(economics.margin_usd)
+    .bind(provider_payload)
+    .bind(&provider_message_id)
+    .execute(&state.db)
+    .await?;
+
+    Ok(provider_message_id)
+}
+
+fn extract_finalized_cost(payload: &InboundSmsWebhook) -> GatewayResult<(f64, String)> {
+    let cost = payload
+        .data
+        .as_ref()
+        .and_then(|data| data.get("payload"))
+        .and_then(|payload| payload.get("cost"))
+        .or_else(|| payload.data.as_ref().and_then(|data| data.get("cost")))
+        .ok_or_else(|| {
+            GatewayError::Upstream("message.finalized webhook missing cost object".to_string())
+        })?;
+    let amount = cost
+        .get("amount")
+        .and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|value| value.parse::<f64>().ok()))
+        })
+        .ok_or_else(|| {
+            GatewayError::Upstream("message.finalized webhook cost.amount is invalid".to_string())
+        })?;
+    let currency = cost
+        .get("currency")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("USD")
+        .to_string();
+
+    Ok((amount, currency))
+}
+
+#[derive(Default)]
+struct MessageCostBreakdown {
+    carrier_fee_amount: Option<f64>,
+    carrier_fee_currency: Option<String>,
+    rate_amount: Option<f64>,
+    rate_currency: Option<String>,
+}
+
+fn extract_finalized_cost_breakdown(payload: &InboundSmsWebhook) -> MessageCostBreakdown {
+    let Some(breakdown) = payload
+        .data
+        .as_ref()
+        .and_then(|data| data.get("payload"))
+        .and_then(|payload| payload.get("cost_breakdown"))
+        .or_else(|| {
+            payload
+                .data
+                .as_ref()
+                .and_then(|data| data.get("cost_breakdown"))
+        })
+    else {
+        return MessageCostBreakdown::default();
+    };
+
+    MessageCostBreakdown {
+        carrier_fee_amount: cost_component_amount(breakdown, "carrier_fee"),
+        carrier_fee_currency: cost_component_currency(breakdown, "carrier_fee"),
+        rate_amount: cost_component_amount(breakdown, "rate"),
+        rate_currency: cost_component_currency(breakdown, "rate"),
+    }
+}
+
+fn cost_component_amount(breakdown: &Value, key: &str) -> Option<f64> {
+    breakdown
+        .get(key)
+        .and_then(|component| component.get("amount"))
+        .and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|value| value.parse::<f64>().ok()))
+        })
+}
+
+fn cost_component_currency(breakdown: &Value, key: &str) -> Option<String> {
+    breakdown
+        .get(key)
+        .and_then(|component| component.get("currency"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn normalize_phone_number(phone_number: &str) -> GatewayResult<String> {

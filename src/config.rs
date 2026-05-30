@@ -212,6 +212,15 @@ impl Config {
             ));
         }
 
+        if production_env()
+            && self.telnyx_webhook_public_key.trim().is_empty()
+            && self.telnyx_webhook_signing_secret.trim().is_empty()
+        {
+            return Err(GatewayError::Config(
+                "TELNYX_WEBHOOK_PUBLIC_KEY or TELNYX_WEBHOOK_SIGNING_SECRET is required in production".to_string(),
+            ));
+        }
+
         self.bind_addr();
         Ok(())
     }
@@ -276,4 +285,15 @@ fn validate_wallet_like(key: &'static str, value: &str) -> GatewayResult<()> {
     }
 
     Ok(())
+}
+
+fn production_env() -> bool {
+    env::var("APP_ENV")
+        .or_else(|_| env::var("RUST_ENV"))
+        .or_else(|_| env::var("ENV"))
+        .map(|value| {
+            let value = value.trim().to_lowercase();
+            value == "production" || value == "prod"
+        })
+        .unwrap_or(false)
 }

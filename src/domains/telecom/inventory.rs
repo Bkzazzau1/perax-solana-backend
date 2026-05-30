@@ -2,6 +2,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
 };
+use reqwest::Response;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -95,10 +96,15 @@ pub struct MyNumberRecord {
     pub country: Option<String>,
     pub plan: Option<String>,
     pub status: String,
+    pub telnyx_phone_number_id: Option<String>,
+    pub provider_status: Option<String>,
+    pub messaging_profile_id: Option<String>,
+    pub messaging_product: Option<String>,
     pub setup_fee_credits: Option<f64>,
     pub monthly_fee_credits: Option<f64>,
     pub estimated_usd_cost: Option<f64>,
     pub provider_cost_currency: Option<String>,
+    pub provider_cost_source: Option<String>,
     pub margin_credits: Option<f64>,
     pub margin_usd: Option<f64>,
     pub next_renewal_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -114,10 +120,15 @@ pub struct MyNumberDto {
     pub country: Option<String>,
     pub plan: Option<String>,
     pub status: String,
+    pub telnyx_phone_number_id: Option<String>,
+    pub provider_status: Option<String>,
+    pub messaging_profile_id: Option<String>,
+    pub messaging_product: Option<String>,
     pub setup_fee_credits: Option<f64>,
     pub monthly_fee_credits: Option<f64>,
     pub estimated_usd_cost: Option<f64>,
     pub provider_cost_currency: Option<String>,
+    pub provider_cost_source: Option<String>,
     pub margin_credits: Option<f64>,
     pub margin_usd: Option<f64>,
     pub next_renewal_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -167,6 +178,10 @@ struct NumberSubscriptionRecord {
     id: Uuid,
     account_id: Option<Uuid>,
     phone_number: String,
+    telnyx_phone_number_id: Option<String>,
+    provider_status: Option<String>,
+    messaging_profile_id: Option<String>,
+    messaging_product: Option<String>,
     monthly_fee_credits: Option<f64>,
     next_renewal_at: Option<chrono::DateTime<chrono::Utc>>,
     billing_status: Option<String>,
@@ -180,6 +195,9 @@ pub struct NumberSubscriptionActionResponse {
     pub phone_number: String,
     pub status: String,
     pub billing_status: String,
+    pub provider_status: Option<String>,
+    pub messaging_profile_id: Option<String>,
+    pub messaging_product: Option<String>,
     pub monthly_fee_credits: Option<f64>,
     pub next_renewal_at: Option<chrono::DateTime<chrono::Utc>>,
     pub message: String,
@@ -192,6 +210,18 @@ pub struct ProvisioningResponse {
     pub status: String,
     pub credits_deducted: f64,
     pub regulatory_note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NumberProviderSyncResponse {
+    pub id: Uuid,
+    pub phone_number: String,
+    pub telnyx_phone_number_id: Option<String>,
+    pub provider_status: Option<String>,
+    pub messaging_profile_id: Option<String>,
+    pub messaging_product: Option<String>,
+    pub provider_payload: Value,
 }
 
 pub async fn search_global_numbers(
@@ -341,10 +371,15 @@ pub async fn list_my_numbers(
                country,
                plan,
                status,
+               telnyx_phone_number_id,
+               provider_status,
+               messaging_profile_id,
+               messaging_product,
                setup_fee_credits::double precision as setup_fee_credits,
                monthly_fee_credits::double precision as monthly_fee_credits,
                estimated_usd_cost::double precision as estimated_usd_cost,
                provider_cost_currency,
+               provider_cost_source,
                margin_credits::double precision as margin_credits,
                margin_usd::double precision as margin_usd,
                next_renewal_at,
@@ -365,22 +400,171 @@ pub async fn list_my_numbers(
     }))
 }
 
+pub async fn sync_number_provider_status(
+    State(state): State<AppState>,
+    account: AuthenticatedAccount,
+    Path(number_id): Path<Uuid>,
+) -> GatewayResult<Json<NumberProviderSyncResponse>> {
+    let record = get_user_number_subscription(&state, account.account_id, number_id).await?;
+    let provider_identifier = telnyx_number_identifier(&record);
+    let response = TelnyxClient::new(&state)
+        .retrieve_number_messaging(&provider_identifier)
+        .await?;
+    let http_status = response.status();
+    let provider_payload = response_json_or_status(response).await?;
+    log_provider_transaction(
+        &state,
+        "retrieve_number_messaging",
+        Some(account.account_id),
+        "telnyx_number_sync",
+        &format!("telnyx_number_sync:{number_id}"),
+        Some(serde_json::json!({ "identifier": provider_identifier })),
+        Some(provider_payload.clone()),
+        Some(http_status.as_u16()),
+        http_status.is_success(),
+        if http_status.is_success() {
+            None
+        } else {
+            Some("Telnyx number messaging status sync failed")
+        },
+    )
+    .await?;
+
+    if !http_status.is_success() {
+        return Err(GatewayError::Upstream(format!(
+            "Telnyx number status sync failed: {provider_payload}"
+        )));
+    }
+
+    let telnyx_phone_number_id = provider_payload["data"]["id"].as_str().map(str::to_string);
+    let provider_status = provider_payload["data"]["record_type"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| Some("synced".to_string()));
+    let messaging_profile_id = provider_payload["data"]["messaging_profile_id"]
+        .as_str()
+        .map(str::to_string);
+    let messaging_product = provider_payload["data"]["messaging_product"]
+        .as_str()
+        .map(str::to_string);
+
+    sqlx::query(
+        r#"
+        update provisioned_numbers
+        set telnyx_phone_number_id = coalesce($1, telnyx_phone_number_id),
+            provider_status = $2,
+            provider_payload = $3,
+            messaging_profile_id = $4,
+            messaging_product = $5,
+            last_provider_sync_at = now(),
+            updated_at = now()
+        where id = $6 and account_id = $7
+        "#,
+    )
+    .bind(&telnyx_phone_number_id)
+    .bind(&provider_status)
+    .bind(&provider_payload)
+    .bind(&messaging_profile_id)
+    .bind(&messaging_product)
+    .bind(number_id)
+    .bind(account.account_id)
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(NumberProviderSyncResponse {
+        id: number_id,
+        phone_number: record.phone_number,
+        telnyx_phone_number_id,
+        provider_status,
+        messaging_profile_id,
+        messaging_product,
+        provider_payload,
+    }))
+}
+
 pub async fn cancel_number_subscription(
     State(state): State<AppState>,
     account: AuthenticatedAccount,
     Path(number_id): Path<Uuid>,
 ) -> GatewayResult<Json<NumberSubscriptionActionResponse>> {
+    let current = get_user_number_subscription(&state, account.account_id, number_id).await?;
+    let provider_identifier = telnyx_number_identifier(&current);
+    let client = TelnyxClient::new(&state);
+
+    let unassign_response = client
+        .update_number_messaging_profile(&provider_identifier, "")
+        .await?;
+    let unassign_status = unassign_response.status();
+    let unassign_payload = response_json_or_status(unassign_response).await?;
+    log_provider_transaction(
+        &state,
+        "unassign_number_messaging_profile",
+        Some(account.account_id),
+        "telnyx_number_cancel",
+        &format!("telnyx_number_cancel_unassign:{number_id}"),
+        Some(serde_json::json!({
+            "identifier": provider_identifier,
+            "messagingProfileId": ""
+        })),
+        Some(unassign_payload.clone()),
+        Some(unassign_status.as_u16()),
+        unassign_status.is_success(),
+        if unassign_status.is_success() {
+            None
+        } else {
+            Some("Telnyx messaging profile unassign failed")
+        },
+    )
+    .await?;
+
+    let release_response = client.release_phone_number(&provider_identifier).await?;
+    let release_status = release_response.status();
+    let release_payload = response_json_or_status(release_response).await?;
+    log_provider_transaction(
+        &state,
+        "release_phone_number",
+        Some(account.account_id),
+        "telnyx_number_cancel",
+        &format!("telnyx_number_cancel_release:{number_id}"),
+        Some(serde_json::json!({ "identifier": provider_identifier })),
+        Some(release_payload.clone()),
+        Some(release_status.as_u16()),
+        release_status.is_success(),
+        if release_status.is_success() {
+            None
+        } else {
+            Some("Telnyx number release failed")
+        },
+    )
+    .await?;
+
+    if !release_status.is_success() {
+        return Err(GatewayError::Upstream(format!(
+            "Telnyx number release failed: {release_payload}"
+        )));
+    }
+
     let record = sqlx::query_as::<_, NumberSubscriptionRecord>(
         r#"
         update provisioned_numbers
         set billing_status = 'cancelled',
             status = 'cancelled',
+            provider_status = 'released',
+            provider_payload = $3,
+            messaging_profile_id = null,
+            messaging_product = null,
+            last_provider_sync_at = now(),
+            cancelled_at = now(),
             next_renewal_at = null,
             updated_at = now()
         where id = $1 and account_id = $2
         returning id,
                   account_id,
                   phone_number,
+                  telnyx_phone_number_id,
+                  provider_status,
+                  messaging_profile_id,
+                  messaging_product,
                   monthly_fee_credits::double precision as monthly_fee_credits,
                   next_renewal_at,
                   billing_status,
@@ -389,13 +573,13 @@ pub async fn cancel_number_subscription(
     )
     .bind(number_id)
     .bind(account.account_id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| GatewayError::Upstream("Number subscription not found.".to_string()))?;
+    .bind(release_payload)
+    .fetch_one(&state.db)
+    .await?;
 
     Ok(Json(NumberSubscriptionActionResponse::from_record(
         record,
-        "Number subscription cancelled. Renewal billing has stopped.".to_string(),
+        "Number subscription cancelled at Telnyx. Renewal billing has stopped.".to_string(),
     )))
 }
 
@@ -413,16 +597,114 @@ pub async fn reactivate_number_subscription(
         ));
     }
 
+    let source_reference = format!("telnyx_number_reactivation:{number_id}");
     debit_credits(
         &state,
         account.account_id,
         monthly_fee,
         "telnyx_number_reactivation",
-        &format!("telnyx_number_reactivation:{number_id}"),
+        &source_reference,
         "Telnyx number subscription reactivation",
         serde_json::json!({ "numberId": number_id, "phoneNumber": record.phone_number }),
     )
     .await?;
+
+    let client = TelnyxClient::new(&state);
+    let order_response = client.order_number(&record.phone_number).await?;
+    let order_status = order_response.status();
+    let order_payload = response_json_or_status(order_response).await?;
+    log_provider_transaction(
+        &state,
+        "reactivate_order_number",
+        Some(account.account_id),
+        "telnyx_number_reactivation",
+        &source_reference,
+        Some(serde_json::json!({ "phoneNumber": record.phone_number })),
+        Some(order_payload.clone()),
+        Some(order_status.as_u16()),
+        order_status.is_success(),
+        if order_status.is_success() {
+            None
+        } else {
+            Some("Telnyx number reactivation order failed")
+        },
+    )
+    .await?;
+
+    if !order_status.is_success() {
+        credit_credits(
+            &state,
+            account.account_id,
+            monthly_fee,
+            "telnyx_number_reactivation_reversal",
+            &format!("{source_reference}:provider_rejected"),
+            "Reversal for rejected Telnyx number reactivation",
+            serde_json::json!({
+                "originalSourceReference": source_reference,
+                "phoneNumber": record.phone_number,
+                "providerStatus": order_status.as_u16(),
+                "providerError": order_payload
+            }),
+        )
+        .await?;
+        return Err(GatewayError::Upstream(format!(
+            "Telnyx number reactivation failed: {order_payload}"
+        )));
+    }
+
+    let telnyx_order_id = order_payload["data"]["id"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("reactivation_{number_id}"));
+    let provider_status = order_payload["data"]["status"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| "pending".to_string());
+    let telnyx_phone_number_id = extract_telnyx_phone_number_id(&order_payload);
+    let mut provider_payload = order_payload.clone();
+    let mut messaging_profile_id = None;
+    let mut messaging_product = None;
+
+    if !state.config.telnyx_messaging_profile_id.trim().is_empty() {
+        let identifier = telnyx_phone_number_id
+            .as_deref()
+            .unwrap_or(record.phone_number.as_str());
+        let assign_response = client
+            .update_number_messaging_profile(identifier, &state.config.telnyx_messaging_profile_id)
+            .await?;
+        let assign_status = assign_response.status();
+        let assign_payload = response_json_or_status(assign_response).await?;
+        log_provider_transaction(
+            &state,
+            "assign_number_messaging_profile",
+            Some(account.account_id),
+            "telnyx_number_reactivation",
+            &format!("{source_reference}:messaging_profile"),
+            Some(serde_json::json!({
+                "identifier": identifier,
+                "messagingProfileId": state.config.telnyx_messaging_profile_id
+            })),
+            Some(assign_payload.clone()),
+            Some(assign_status.as_u16()),
+            assign_status.is_success(),
+            if assign_status.is_success() {
+                None
+            } else {
+                Some("Telnyx messaging profile assign failed")
+            },
+        )
+        .await?;
+
+        if assign_status.is_success() {
+            messaging_profile_id = assign_payload["data"]["messaging_profile_id"]
+                .as_str()
+                .map(str::to_string);
+            messaging_product = assign_payload["data"]["messaging_product"]
+                .as_str()
+                .map(str::to_string);
+            provider_payload = assign_payload;
+        }
+    }
 
     let next_renewal_at = chrono::Utc::now() + chrono::Duration::days(30);
     let updated = sqlx::query_as::<_, NumberSubscriptionRecord>(
@@ -430,18 +712,36 @@ pub async fn reactivate_number_subscription(
         update provisioned_numbers
         set billing_status = 'active',
             status = 'reserved',
-            next_renewal_at = $1,
+            telnyx_order_id = $1,
+            telnyx_phone_number_id = coalesce($2, telnyx_phone_number_id),
+            provider_status = $3,
+            provider_payload = $4,
+            messaging_profile_id = $5,
+            messaging_product = $6,
+            last_provider_sync_at = now(),
+            cancelled_at = null,
+            next_renewal_at = $7,
             updated_at = now()
-        where id = $2 and account_id = $3
+        where id = $8 and account_id = $9
         returning id,
                   account_id,
                   phone_number,
+                  telnyx_phone_number_id,
+                  provider_status,
+                  messaging_profile_id,
+                  messaging_product,
                   monthly_fee_credits::double precision as monthly_fee_credits,
                   next_renewal_at,
                   billing_status,
                   status
         "#,
     )
+    .bind(telnyx_order_id)
+    .bind(telnyx_phone_number_id)
+    .bind(provider_status)
+    .bind(provider_payload)
+    .bind(messaging_profile_id)
+    .bind(messaging_product)
     .bind(next_renewal_at)
     .bind(number_id)
     .bind(account.account_id)
@@ -615,9 +915,8 @@ pub async fn purchase_number(
     )
     .await?;
 
-    let response = TelnyxClient::new(&state)
-        .order_number(&phone_number)
-        .await?;
+    let client = TelnyxClient::new(&state);
+    let response = client.order_number(&phone_number).await?;
     let http_status = response.status();
 
     if !http_status.is_success() {
@@ -678,6 +977,51 @@ pub async fn purchase_number(
         .as_str()
         .unwrap_or("pending")
         .to_string();
+    let telnyx_phone_number_id = extract_telnyx_phone_number_id(&resp_json);
+    let mut provider_payload = resp_json.clone();
+    let mut messaging_profile_id = None;
+    let mut messaging_product = None;
+
+    if !state.config.telnyx_messaging_profile_id.trim().is_empty() {
+        let identifier = telnyx_phone_number_id
+            .as_deref()
+            .unwrap_or(phone_number.as_str());
+        let assign_response = client
+            .update_number_messaging_profile(identifier, &state.config.telnyx_messaging_profile_id)
+            .await?;
+        let assign_status = assign_response.status();
+        let assign_payload = response_json_or_status(assign_response).await?;
+        log_provider_transaction(
+            &state,
+            "assign_number_messaging_profile",
+            Some(account.account_id),
+            "telnyx_number_order",
+            &format!("{source_reference}:messaging_profile"),
+            Some(serde_json::json!({
+                "identifier": identifier,
+                "messagingProfileId": state.config.telnyx_messaging_profile_id
+            })),
+            Some(assign_payload.clone()),
+            Some(assign_status.as_u16()),
+            assign_status.is_success(),
+            if assign_status.is_success() {
+                None
+            } else {
+                Some("Telnyx messaging profile assign failed")
+            },
+        )
+        .await?;
+
+        if assign_status.is_success() {
+            messaging_profile_id = assign_payload["data"]["messaging_profile_id"]
+                .as_str()
+                .map(str::to_string);
+            messaging_product = assign_payload["data"]["messaging_product"]
+                .as_str()
+                .map(str::to_string);
+            provider_payload = assign_payload;
+        }
+    }
 
     save_provisioned_number(
         &state,
@@ -686,6 +1030,11 @@ pub async fn purchase_number(
         &order_id,
         &status,
         &economics,
+        telnyx_phone_number_id.as_deref(),
+        Some(&status),
+        &provider_payload,
+        messaging_profile_id.as_deref(),
+        messaging_product.as_deref(),
     )
     .await?;
 
@@ -756,10 +1105,11 @@ async fn save_reserved_number(
             billing_status,
             estimated_usd_cost,
             provider_cost_currency,
+            provider_cost_source,
             margin_credits,
             margin_usd
         )
-        values (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, 'active', $10, $11, $12, $13)
+        values (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, 'active', $10, $11, $12, $13, $14)
         on conflict (phone_number) do update
         set account_id = excluded.account_id,
             telnyx_order_id = excluded.telnyx_order_id,
@@ -772,6 +1122,7 @@ async fn save_reserved_number(
             billing_status = excluded.billing_status,
             estimated_usd_cost = excluded.estimated_usd_cost,
             provider_cost_currency = excluded.provider_cost_currency,
+            provider_cost_source = excluded.provider_cost_source,
             margin_credits = excluded.margin_credits,
             margin_usd = excluded.margin_usd,
             updated_at = now()
@@ -788,6 +1139,7 @@ async fn save_reserved_number(
     .bind(next_renewal_at)
     .bind(economics.estimated_usd_cost)
     .bind(&economics.provider_cost_currency)
+    .bind(&economics.provider_cost_source)
     .bind(economics.margin_credits)
     .bind(economics.margin_usd)
     .execute(&state.db)
@@ -803,6 +1155,11 @@ async fn save_provisioned_number(
     order_id: &str,
     status: &str,
     economics: &TelnyxEconomics,
+    telnyx_phone_number_id: Option<&str>,
+    provider_status: Option<&str>,
+    provider_payload: &Value,
+    messaging_profile_id: Option<&str>,
+    messaging_product: Option<&str>,
 ) -> GatewayResult<()> {
     sqlx::query(
         r#"
@@ -812,18 +1169,32 @@ async fn save_provisioned_number(
             phone_number,
             telnyx_order_id,
             status,
+            telnyx_phone_number_id,
+            provider_status,
+            provider_payload,
+            messaging_profile_id,
+            messaging_product,
+            last_provider_sync_at,
             estimated_usd_cost,
             provider_cost_currency,
+            provider_cost_source,
             margin_credits,
             margin_usd
         )
-        values (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8)
+        values (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10, $11, $12, $13, $14)
         on conflict (phone_number) do update
         set account_id = excluded.account_id,
             telnyx_order_id = excluded.telnyx_order_id,
             status = excluded.status,
+            telnyx_phone_number_id = coalesce(excluded.telnyx_phone_number_id, provisioned_numbers.telnyx_phone_number_id),
+            provider_status = excluded.provider_status,
+            provider_payload = excluded.provider_payload,
+            messaging_profile_id = excluded.messaging_profile_id,
+            messaging_product = excluded.messaging_product,
+            last_provider_sync_at = excluded.last_provider_sync_at,
             estimated_usd_cost = excluded.estimated_usd_cost,
             provider_cost_currency = excluded.provider_cost_currency,
+            provider_cost_source = excluded.provider_cost_source,
             margin_credits = excluded.margin_credits,
             margin_usd = excluded.margin_usd,
             updated_at = now()
@@ -833,8 +1204,14 @@ async fn save_provisioned_number(
     .bind(phone_number)
     .bind(order_id)
     .bind(status)
+    .bind(telnyx_phone_number_id)
+    .bind(provider_status)
+    .bind(provider_payload)
+    .bind(messaging_profile_id)
+    .bind(messaging_product)
     .bind(economics.estimated_usd_cost)
     .bind(&economics.provider_cost_currency)
+    .bind(&economics.provider_cost_source)
     .bind(economics.margin_credits)
     .bind(economics.margin_usd)
     .execute(&state.db)
@@ -853,6 +1230,10 @@ async fn get_user_number_subscription(
         select id,
                account_id,
                phone_number,
+               telnyx_phone_number_id,
+               provider_status,
+               messaging_profile_id,
+               messaging_product,
                monthly_fee_credits::double precision as monthly_fee_credits,
                next_renewal_at,
                billing_status,
@@ -886,6 +1267,48 @@ async fn mark_number_past_due(state: &AppState, number_id: Uuid) -> GatewayResul
     Ok(())
 }
 
+fn telnyx_number_identifier(record: &NumberSubscriptionRecord) -> String {
+    record
+        .telnyx_phone_number_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(record.phone_number.as_str())
+        .to_string()
+}
+
+fn extract_telnyx_phone_number_id(payload: &Value) -> Option<String> {
+    payload["data"]["phone_numbers"]
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("id"))
+        .and_then(Value::as_str)
+        .or_else(|| payload["data"]["phone_number_id"].as_str())
+        .or_else(|| {
+            let record_type = payload["data"]["record_type"].as_str();
+            if record_type == Some("messaging_settings") {
+                payload["data"]["id"].as_str()
+            } else {
+                None
+            }
+        })
+        .map(str::to_string)
+}
+
+async fn response_json_or_status(response: Response) -> GatewayResult<Value> {
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if text.trim().is_empty() {
+        return Ok(serde_json::json!({ "status": status.as_u16() }));
+    }
+
+    Ok(serde_json::from_str(&text).unwrap_or_else(|_| {
+        serde_json::json!({
+            "status": status.as_u16(),
+            "body": text
+        })
+    }))
+}
+
 impl NumberSubscriptionActionResponse {
     fn from_record(record: NumberSubscriptionRecord, message: String) -> Self {
         Self {
@@ -895,6 +1318,9 @@ impl NumberSubscriptionActionResponse {
             billing_status: record
                 .billing_status
                 .unwrap_or_else(|| "unknown".to_string()),
+            provider_status: record.provider_status,
+            messaging_profile_id: record.messaging_profile_id,
+            messaging_product: record.messaging_product,
             monthly_fee_credits: record.monthly_fee_credits,
             next_renewal_at: record.next_renewal_at,
             message,
@@ -923,10 +1349,15 @@ impl From<MyNumberRecord> for MyNumberDto {
             country: value.country,
             plan: value.plan,
             status: value.status,
+            telnyx_phone_number_id: value.telnyx_phone_number_id,
+            provider_status: value.provider_status,
+            messaging_profile_id: value.messaging_profile_id,
+            messaging_product: value.messaging_product,
             setup_fee_credits: value.setup_fee_credits,
             monthly_fee_credits: value.monthly_fee_credits,
             estimated_usd_cost: value.estimated_usd_cost,
             provider_cost_currency: value.provider_cost_currency,
+            provider_cost_source: value.provider_cost_source,
             margin_credits: value.margin_credits,
             margin_usd: value.margin_usd,
             next_renewal_at: value.next_renewal_at,

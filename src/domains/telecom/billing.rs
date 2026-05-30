@@ -17,6 +17,7 @@ pub struct TelnyxEconomics {
     pub credits_charged: f64,
     pub estimated_usd_cost: f64,
     pub provider_cost_currency: String,
+    pub provider_cost_source: String,
     pub margin_credits: f64,
     pub margin_usd: f64,
 }
@@ -272,9 +273,10 @@ pub async fn log_provider_transaction_with_economics(
             credits_charged,
             estimated_usd_cost,
             provider_cost_currency,
+            provider_cost_source,
             margin_credits,
             margin_usd
-        ) values ('telnyx', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        ) values ('telnyx', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         "#,
     )
     .bind(provider_action)
@@ -289,6 +291,7 @@ pub async fn log_provider_transaction_with_economics(
     .bind(economics.map(|value| value.credits_charged))
     .bind(economics.map(|value| value.estimated_usd_cost))
     .bind(economics.map(|value| value.provider_cost_currency.as_str()))
+    .bind(economics.map(|value| value.provider_cost_source.as_str()))
     .bind(economics.map(|value| value.margin_credits))
     .bind(economics.map(|value| value.margin_usd))
     .execute(&state.db)
@@ -298,15 +301,25 @@ pub async fn log_provider_transaction_with_economics(
 }
 
 pub fn estimate_telnyx_economics(credits_charged: f64, estimated_usd_cost: f64) -> TelnyxEconomics {
+    telnyx_economics_with_cost_source(credits_charged, estimated_usd_cost, "USD", "estimate")
+}
+
+pub fn telnyx_economics_with_cost_source(
+    credits_charged: f64,
+    provider_usd_cost: f64,
+    provider_cost_currency: &str,
+    provider_cost_source: &str,
+) -> TelnyxEconomics {
     let credits_charged = round_credits(credits_charged);
-    let estimated_usd_cost = round_credits(estimated_usd_cost.max(0.0));
+    let estimated_usd_cost = round_credits(provider_usd_cost.max(0.0));
     let credit_usd_value = telnyx_credit_usd_value();
     let revenue_usd = credits_charged * credit_usd_value;
 
     TelnyxEconomics {
         credits_charged,
         estimated_usd_cost,
-        provider_cost_currency: "USD".to_string(),
+        provider_cost_currency: provider_cost_currency.trim().to_uppercase(),
+        provider_cost_source: provider_cost_source.to_string(),
         margin_credits: round_credits(credits_charged - (estimated_usd_cost / credit_usd_value)),
         margin_usd: round_credits(revenue_usd - estimated_usd_cost),
     }
