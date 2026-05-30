@@ -71,6 +71,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/ai/access/check", post(check_access))
         .route("/ai/documents/analyze", post(analyze_document))
+        .merge(super::copy::router())
 }
 
 async fn check_access(
