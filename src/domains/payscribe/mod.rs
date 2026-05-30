@@ -17,6 +17,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/payscribe/status", get(payscribe_status))
         .route("/payscribe/data/lookup", get(data_lookup))
+        .route("/payscribe/data/quote", get(data_quote))
         .route("/payscribe/data/vend", post(vend_data))
         .route("/payscribe/requery", get(requery_transaction))
 }
@@ -35,6 +36,24 @@ struct PayscribeStatusResponse {
 #[serde(rename_all = "camelCase")]
 struct DataLookupParams {
     network: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DataQuoteParams {
+    network: String,
+    plan: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DataQuoteResponse {
+    accepted: bool,
+    network: String,
+    plan: String,
+    plan_amount: f64,
+    charge_credits: f64,
+    pricing_policy: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,6 +131,38 @@ async fn data_lookup(
         "providerStatus": status.as_u16(),
         "providerResponse": body
     })))
+}
+
+async fn data_quote(
+    State(state): State<AppState>,
+    Query(params): Query<DataQuoteParams>,
+) -> GatewayResult<Json<DataQuoteResponse>> {
+    let network = params.network.trim().to_lowercase();
+    let plan = params.plan.trim().to_string();
+    if !is_supported_data_network(&network) {
+        return Err(GatewayError::Upstream("unsupported data network".to_string()));
+    }
+    if plan.is_empty() {
+        return Err(GatewayError::Upstream("plan is required".to_string()));
+    }
+
+    let lookup = fetch_data_lookup(&state, &network).await?;
+    let plan_amount = find_plan_amount(&lookup, &plan).ok_or_else(|| {
+        GatewayError::Upstream("selected data plan was not found in Payscribe lookup response".to_string())
+    })?;
+    let charge_credits = calculate_data_charge_credits(plan_amount);
+
+    Ok(Json(DataQuoteResponse {
+        accepted: true,
+        network,
+        plan,
+        plan_amount,
+        charge_credits,
+        pricing_policy: json!({
+            "creditsPerNaira": payscribe_data_credits_per_naira(),
+            "serviceFeeCredits": payscribe_data_service_fee_credits()
+        }),
+    }))
 }
 
 async fn vend_data(
@@ -274,19 +325,24 @@ async fn fetch_data_lookup(state: &AppState, network: &str) -> GatewayResult<Val
     Ok(body)
 }
 
-fn calculate_data_charge_credits(plan_amount: f64) -> f64 {
-    let credits_per_naira = std::env::var("PAYSCRIBE_DATA_CREDITS_PER_NAIRA")
+fn payscribe_data_credits_per_naira() -> f64 {
+    std::env::var("PAYSCRIBE_DATA_CREDITS_PER_NAIRA")
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| *value > 0.0)
-        .unwrap_or(1.0);
-    let service_fee = std::env::var("PAYSCRIBE_DATA_SERVICE_FEE_CREDITS")
+        .unwrap_or(1.0)
+}
+
+fn payscribe_data_service_fee_credits() -> f64 {
+    std::env::var("PAYSCRIBE_DATA_SERVICE_FEE_CREDITS")
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| *value >= 0.0)
-        .unwrap_or(0.0);
+        .unwrap_or(0.0)
+}
 
-    ((plan_amount * credits_per_naira + service_fee) * 100.0).round() / 100.0
+fn calculate_data_charge_credits(plan_amount: f64) -> f64 {
+    ((plan_amount * payscribe_data_credits_per_naira() + payscribe_data_service_fee_credits()) * 100.0).round() / 100.0
 }
 
 fn find_plan_amount(value: &Value, plan_code: &str) -> Option<f64> {
