@@ -12,6 +12,7 @@ use crate::{error::{GatewayError, GatewayResult}, state::AppState};
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/payscribe/status", get(payscribe_status))
+        .route("/payscribe/data/lookup", get(data_lookup))
         .route("/payscribe/data/vend", post(vend_data))
         .route("/payscribe/requery", get(requery_transaction))
 }
@@ -24,6 +25,12 @@ struct PayscribeStatusResponse {
     api_key_configured: bool,
     supported_services: Vec<&'static str>,
     message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DataLookupParams {
+    network: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +83,32 @@ async fn payscribe_status() -> Json<PayscribeStatusResponse> {
             "PAYSCRIBE_API_KEY is required before live data vending.".to_string()
         },
     })
+}
+
+async fn data_lookup(
+    State(state): State<AppState>,
+    Query(params): Query<DataLookupParams>,
+) -> GatewayResult<Json<Value>> {
+    let network = params.network.unwrap_or_default().trim().to_lowercase();
+    if !network.is_empty() && !is_supported_data_network(&network) {
+        return Err(GatewayError::Upstream("unsupported data network".to_string()));
+    }
+
+    let path = if network.is_empty() {
+        "/data/lookup".to_string()
+    } else {
+        format!("/data/lookup?network={network}")
+    };
+    let response = payscribe_get(&state, &path).await?;
+    let status = response.status();
+    let body: Value = response.json().await?;
+
+    Ok(Json(json!({
+        "accepted": status.is_success(),
+        "network": if network.is_empty() { Value::Null } else { Value::String(network) },
+        "providerStatus": status.as_u16(),
+        "providerResponse": body
+    })))
 }
 
 async fn vend_data(
@@ -168,7 +201,7 @@ async fn requery_transaction(
 
 fn validate_data_request(request: &DataVendRequest) -> GatewayResult<()> {
     let network = request.network.trim().to_lowercase();
-    if !matches!(network.as_str(), "mtn" | "glo" | "airtel" | "9mobile" | "smile" | "dstvshowmax") {
+    if !is_supported_data_network(&network) {
         return Err(GatewayError::Upstream("unsupported data network".to_string()));
     }
     if request.plan.trim().is_empty() {
@@ -178,6 +211,10 @@ fn validate_data_request(request: &DataVendRequest) -> GatewayResult<()> {
         return Err(GatewayError::Upstream("recipient is required".to_string()));
     }
     Ok(())
+}
+
+fn is_supported_data_network(network: &str) -> bool {
+    matches!(network, "mtn" | "glo" | "airtel" | "9mobile" | "smile" | "dstvshowmax")
 }
 
 async fn payscribe_post(state: &AppState, path: &str, payload: Value) -> GatewayResult<reqwest::Response> {
