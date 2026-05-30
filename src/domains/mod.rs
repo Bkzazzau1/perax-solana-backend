@@ -12,6 +12,8 @@ pub mod paystack;
 pub mod payscribe;
 pub mod pricing;
 pub mod protocol;
+pub mod pyth;
 pub mod solana;
 pub mod telecom;
 pub mod utility_catalog;
+pub mod v0_codegen;
