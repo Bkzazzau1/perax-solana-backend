@@ -35,6 +35,7 @@ async fn main() -> GatewayResult<()> {
         .merge(domains::admin_pex::router())
         .merge(domains::admin_pricing::router())
         .merge(domains::payments::router())
+        .merge(domains::paystack::router())
         .merge(domains::pricing::router())
         .merge(domains::protocol::router())
         .merge(domains::utility_catalog::router())
