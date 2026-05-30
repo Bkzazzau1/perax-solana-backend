@@ -1,8 +1,15 @@
-use axum::{Json, Router, extract::{Query, State}, routing::get};
+use axum::{
+    Json, Router,
+    extract::{Query, State},
+    routing::get,
+};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use crate::{error::{GatewayError, GatewayResult}, state::AppState};
+use crate::{
+    error::{GatewayError, GatewayResult},
+    state::AppState,
+};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -52,25 +59,47 @@ async fn pyth_latest(
     State(state): State<AppState>,
     Query(query): Query<PythLatestQuery>,
 ) -> GatewayResult<Json<PythLatestResponse>> {
-    let symbol = query.symbol.as_deref().map(|value| value.trim().to_uppercase()).filter(|value| !value.is_empty());
-    let feed_id = query.feed_id
+    let symbol = query
+        .symbol
+        .as_deref()
+        .map(|value| value.trim().to_uppercase())
+        .filter(|value| !value.is_empty());
+    let feed_id = query
+        .feed_id
         .as_deref()
         .map(clean_feed_id)
         .filter(|value| !value.is_empty())
         .or_else(|| symbol.as_deref().and_then(resolve_symbol_feed))
-        .ok_or_else(|| GatewayError::Upstream("feedId or supported symbol is required".to_string()))?;
+        .ok_or_else(|| {
+            GatewayError::Upstream("feedId or supported symbol is required".to_string())
+        })?;
 
-    let url = format!("{}/v2/updates/price/latest?ids[]={}&parsed=true", pyth_price_service_url(), feed_id);
-    let response = state.http.get(url).send().await?;
+    let url = format!("{}/v2/updates/price/latest", pyth_price_service_url());
+    let response = state
+        .http
+        .get(url)
+        .query(&[("ids[]", feed_id.as_str()), ("parsed", "true")])
+        .send()
+        .await?;
     let status = response.status();
     let body: Value = response.json().await?;
     if !status.is_success() {
-        return Err(GatewayError::Upstream(format!("Pyth latest price request failed: {body}")));
+        return Err(GatewayError::Upstream(format!(
+            "Pyth latest price request failed: {body}"
+        )));
     }
 
-    let parsed = body.get("parsed").and_then(Value::as_array).and_then(|items| items.first()).cloned().unwrap_or(Value::Null);
+    let parsed = body
+        .get("parsed")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .cloned()
+        .unwrap_or(Value::Null);
     let price_obj = parsed.get("price").unwrap_or(&Value::Null);
-    let exponent = price_obj.get("expo").and_then(Value::as_i64).map(|v| v as i32);
+    let exponent = price_obj
+        .get("expo")
+        .and_then(Value::as_i64)
+        .map(|v| v as i32);
     let raw_price = price_obj.get("price").and_then(value_to_f64);
     let raw_conf = price_obj.get("conf").and_then(value_to_f64);
     let price = match (raw_price, exponent) {
@@ -118,7 +147,10 @@ fn resolve_symbol_feed(symbol: &str) -> Option<String> {
 }
 
 fn env_feed(key: &str) -> Option<String> {
-    std::env::var(key).ok().map(|value| clean_feed_id(&value)).filter(|value| !value.is_empty() && !value.starts_with("replace-"))
+    std::env::var(key)
+        .ok()
+        .map(|value| clean_feed_id(&value))
+        .filter(|value| !value.is_empty() && !value.starts_with("replace-"))
 }
 
 fn clean_feed_id(value: &str) -> String {
@@ -126,9 +158,12 @@ fn clean_feed_id(value: &str) -> String {
 }
 
 fn pyth_price_service_url() -> String {
-    std::env::var("PYTH_PRICE_SERVICE_URL").unwrap_or_else(|_| "https://hermes.pyth.network".to_string())
+    std::env::var("PYTH_PRICE_SERVICE_URL")
+        .unwrap_or_else(|_| "https://hermes.pyth.network".to_string())
 }
 
 fn value_to_f64(value: &Value) -> Option<f64> {
-    value.as_f64().or_else(|| value.as_str()?.parse::<f64>().ok())
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.parse::<f64>().ok())
 }

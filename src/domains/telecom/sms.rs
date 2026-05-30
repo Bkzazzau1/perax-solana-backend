@@ -182,6 +182,7 @@ pub async fn send_sms(
         .to_string();
     log_provider_transaction_with_economics(
         &state,
+        "telnyx",
         "send_sms",
         Some(account.account_id),
         "telnyx_sms",

@@ -228,8 +228,38 @@ pub async fn log_provider_transaction(
     success: bool,
     error_message: Option<&str>,
 ) -> GatewayResult<()> {
+    log_named_provider_transaction(
+        state,
+        "telnyx",
+        provider_action,
+        account_id,
+        source,
+        source_reference,
+        request_payload,
+        response_payload,
+        http_status,
+        success,
+        error_message,
+    )
+    .await
+}
+
+pub async fn log_named_provider_transaction(
+    state: &AppState,
+    provider: &str,
+    provider_action: &str,
+    account_id: Option<Uuid>,
+    source: &str,
+    source_reference: &str,
+    request_payload: Option<Value>,
+    response_payload: Option<Value>,
+    http_status: Option<u16>,
+    success: bool,
+    error_message: Option<&str>,
+) -> GatewayResult<()> {
     log_provider_transaction_with_economics(
         state,
+        provider,
         provider_action,
         account_id,
         source,
@@ -246,6 +276,7 @@ pub async fn log_provider_transaction(
 
 pub async fn log_provider_transaction_with_economics(
     state: &AppState,
+    provider: &str,
     provider_action: &str,
     account_id: Option<Uuid>,
     source: &str,
@@ -276,9 +307,10 @@ pub async fn log_provider_transaction_with_economics(
             provider_cost_source,
             margin_credits,
             margin_usd
-        ) values ('telnyx', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         "#,
     )
+    .bind(provider)
     .bind(provider_action)
     .bind(account_id)
     .bind(source)

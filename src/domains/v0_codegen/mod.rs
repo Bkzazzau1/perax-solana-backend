@@ -1,10 +1,17 @@
-use axum::{Json, Router, extract::{Path, State}, routing::{get, post}};
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    routing::{get, post},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    domains::{pricing, telecom::billing::debit_credits},
+    domains::{
+        pricing,
+        telecom::billing::{credit_credits, debit_credits, log_named_provider_transaction},
+    },
     error::{GatewayError, GatewayResult},
     state::AppState,
 };
@@ -87,7 +94,9 @@ async fn v0_quote(
     State(state): State<AppState>,
     Json(payload): Json<V0QuoteRequest>,
 ) -> GatewayResult<Json<V0QuoteResponse>> {
-    let credit_cost = pricing::get_utility_price(&state, "v0_code_generation").await?.credit_cost;
+    let credit_cost = pricing::get_utility_price(&state, "v0_code_generation")
+        .await?
+        .credit_cost;
     Ok(Json(V0QuoteResponse {
         accepted: true,
         service_code: "v0_code_generation".to_string(),
@@ -102,14 +111,26 @@ async fn v0_create_chat(
     Json(payload): Json<V0CreateChatRequest>,
 ) -> GatewayResult<Json<V0GenerationRecord>> {
     if payload.message.trim().is_empty() {
-        return Err(GatewayError::Upstream("message is required for v0 chat generation".to_string()));
+        return Err(GatewayError::Upstream(
+            "message is required for v0 chat generation".to_string(),
+        ));
     }
     if payload.message.chars().count() < 20 {
-        return Err(GatewayError::Upstream("message must be at least 20 characters".to_string()));
+        return Err(GatewayError::Upstream(
+            "message must be at least 20 characters".to_string(),
+        ));
     }
 
-    let credit_cost = pricing::get_utility_price(&state, "v0_code_generation").await?.credit_cost;
-    let reference = payload.ref_id.clone().unwrap_or_else(|| format!("v0_{}", Uuid::new_v4().simple()));
+    let credit_cost = pricing::get_utility_price(&state, "v0_code_generation")
+        .await?
+        .credit_cost;
+    let reference = payload
+        .ref_id
+        .clone()
+        .unwrap_or_else(|| format!("v0_{}", Uuid::new_v4().simple()));
+    if let Some(existing) = find_v0_record(&state, &reference).await? {
+        return Ok(Json(existing));
+    }
     let request_payload = build_v0_payload(&payload);
 
     debit_credits(
@@ -125,15 +146,92 @@ async fn v0_create_chat(
             "hasSystem": payload.system.is_some(),
             "hasModelConfiguration": payload.model_configuration.is_some()
         }),
-    ).await?;
+    )
+    .await?;
 
-    let provider_response = submit_to_v0(&state, request_payload.clone()).await.unwrap_or_else(|err| json!({
-        "submitted": false,
-        "deferred": true,
-        "error": err.to_string(),
-        "note": "Request was recorded and Credits were debited, but live v0 submission needs valid V0_API_KEY and final payload confirmation."
-    }));
-    let status = if provider_response.get("submitted").and_then(Value::as_bool).unwrap_or(false) { "submitted" } else { "created" };
+    let provider_response = match submit_to_v0(&state, request_payload.clone()).await {
+        Ok(value) => value,
+        Err(err) => {
+            let error = err.to_string();
+            credit_credits(
+                &state,
+                payload.account_id,
+                credit_cost,
+                "v0_code_generation_reversal",
+                &format!("{reference}:provider_rejected"),
+                "Reversal for rejected v0 code generation",
+                json!({ "requestReference": reference, "error": error }),
+            )
+            .await?;
+            log_named_provider_transaction(
+                &state,
+                "v0",
+                "create_chat",
+                Some(payload.account_id),
+                "v0_code_generation",
+                &reference,
+                Some(request_payload.clone()),
+                None,
+                None,
+                false,
+                Some(&error),
+            )
+            .await?;
+            return Err(err);
+        }
+    };
+    let submitted = provider_response
+        .get("submitted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let http_status = provider_response
+        .get("httpStatus")
+        .and_then(Value::as_u64)
+        .map(|value| value as u16);
+    if !submitted {
+        credit_credits(
+            &state,
+            payload.account_id,
+            credit_cost,
+            "v0_code_generation_reversal",
+            &format!("{reference}:provider_rejected"),
+            "Reversal for rejected v0 code generation",
+            json!({ "requestReference": reference, "providerResponse": provider_response }),
+        )
+        .await?;
+        log_named_provider_transaction(
+            &state,
+            "v0",
+            "create_chat",
+            Some(payload.account_id),
+            "v0_code_generation",
+            &reference,
+            Some(request_payload.clone()),
+            Some(provider_response.clone()),
+            http_status,
+            false,
+            Some("v0 create chat rejected"),
+        )
+        .await?;
+        return Err(GatewayError::Upstream(format!(
+            "v0 create chat rejected: {provider_response}"
+        )));
+    }
+    log_named_provider_transaction(
+        &state,
+        "v0",
+        "create_chat",
+        Some(payload.account_id),
+        "v0_code_generation",
+        &reference,
+        Some(request_payload.clone()),
+        Some(provider_response.clone()),
+        http_status,
+        true,
+        None,
+    )
+    .await?;
+    let status = "submitted";
     let v0_chat_id = extract_v0_chat_id(&provider_response);
 
     let record = sqlx::query_as::<_, V0GenerationRecord>(
@@ -162,6 +260,25 @@ async fn v0_create_chat(
     .await?;
 
     Ok(Json(record))
+}
+
+async fn find_v0_record(
+    state: &AppState,
+    reference: &str,
+) -> GatewayResult<Option<V0GenerationRecord>> {
+    sqlx::query_as::<_, V0GenerationRecord>(
+        r#"
+        select id, account_id, request_reference, v0_chat_id, status, prompt, mode,
+               credit_cost::float8 as credit_cost, request_payload, provider_response, error_message
+        from v0_generation_requests
+        where request_reference = $1
+        limit 1
+        "#,
+    )
+    .bind(reference)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(Into::into)
 }
 
 async fn v0_result(
@@ -204,7 +321,8 @@ async fn submit_to_v0(state: &AppState, payload: Value) -> GatewayResult<Value> 
     if key.trim().is_empty() {
         return Err(GatewayError::Config("V0_API_KEY is required".to_string()));
     }
-    let response = state.http
+    let response = state
+        .http
         .post(format!("{}/v1/chats", v0_base_url()))
         .bearer_auth(key)
         .json(&payload)
@@ -216,7 +334,8 @@ async fn submit_to_v0(state: &AppState, payload: Value) -> GatewayResult<Value> 
 }
 
 fn extract_v0_chat_id(value: &Value) -> Option<String> {
-    value.get("body")
+    value
+        .get("body")
         .and_then(|body| body.get("id").or_else(|| body.get("chatId")))
         .and_then(Value::as_str)
         .map(str::to_string)

@@ -125,9 +125,16 @@ async fn analyze_document(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("Pasted Text");
-    let text = payload.text.as_deref().unwrap_or_default().trim().to_string();
+    let text = payload
+        .text
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     if text.is_empty() && payload.file_base64.is_none() {
-        return Err(GatewayError::Upstream("text or fileBase64 is required".to_string()));
+        return Err(GatewayError::Upstream(
+            "text or fileBase64 is required".to_string(),
+        ));
     }
 
     let input_mode = payload.input_mode.unwrap_or_else(|| {
@@ -139,10 +146,13 @@ async fn analyze_document(
     });
     let price = pricing::get_utility_price(&state, payload.tool.service_code()).await?;
     let credit_cost = price.credit_cost;
-    let reference = payload
-        .ref_id
-        .clone()
-        .unwrap_or_else(|| format!("{}_{}", payload.tool.service_code(), Uuid::new_v4().simple()));
+    let reference = payload.ref_id.clone().unwrap_or_else(|| {
+        format!(
+            "{}_{}",
+            payload.tool.service_code(),
+            Uuid::new_v4().simple()
+        )
+    });
 
     debit_credits(
         &state,
@@ -161,22 +171,38 @@ async fn analyze_document(
     .await?;
 
     let response = match payload.tool {
-        AiTool::AiDetector => run_ai_detector(source_name, &text, input_mode, credit_cost, reference),
-        AiTool::PlagiarismChecker => run_plagiarism_checker(source_name, &text, credit_cost, reference),
+        AiTool::AiDetector => {
+            run_ai_detector(source_name, &text, input_mode, credit_cost, reference)
+        }
+        AiTool::PlagiarismChecker => {
+            run_plagiarism_checker(source_name, &text, credit_cost, reference)
+        }
         AiTool::Humanizer => run_humanizer(source_name, &text, credit_cost, reference),
     };
 
     Ok(Json(response))
 }
 
-fn run_ai_detector(source_name: &str, text: &str, input_mode: AiInputMode, credit_cost: f64, reference: String) -> AiAnalyzeResponse {
+fn run_ai_detector(
+    source_name: &str,
+    text: &str,
+    input_mode: AiInputMode,
+    credit_cost: f64,
+    reference: String,
+) -> AiAnalyzeResponse {
     let score = ai_pattern_score(text);
     let mut findings = Vec::new();
     if score >= 70.0 {
         findings.push("High machine-pattern risk detected from repetitive sentence rhythm and generic transitions.".to_string());
-        findings.push("Add more personal examples, concrete evidence, and varied sentence structure.".to_string());
+        findings.push(
+            "Add more personal examples, concrete evidence, and varied sentence structure."
+                .to_string(),
+        );
     } else if score >= 40.0 {
-        findings.push("Moderate AI-writing signals detected. Some parts may need more natural rewriting.".to_string());
+        findings.push(
+            "Moderate AI-writing signals detected. Some parts may need more natural rewriting."
+                .to_string(),
+        );
         findings.push("Improve specificity and reduce repeated phrasing.".to_string());
     } else {
         findings.push("Low AI-writing signal based on the MVP detector heuristic.".to_string());
@@ -195,12 +221,25 @@ fn run_ai_detector(source_name: &str, text: &str, input_mode: AiInputMode, credi
     }
 }
 
-fn run_plagiarism_checker(source_name: &str, text: &str, credit_cost: f64, reference: String) -> AiAnalyzeResponse {
+fn run_plagiarism_checker(
+    source_name: &str,
+    text: &str,
+    credit_cost: f64,
+    reference: String,
+) -> AiAnalyzeResponse {
     let score = plagiarism_risk_score(text);
     let findings = vec![
-        "Checked for repeated generic phrases, suspicious repetition, and citation weakness.".to_string(),
-        "Use /ai/copyleaks/submit for premium plagiarism and historical-alignment scan.".to_string(),
-        if score >= 50.0 { "Risk is elevated. Rewrite generic sections and add citations for factual claims.".to_string() } else { "No high-risk pattern found by the MVP checker, but source matching is not yet live.".to_string() },
+        "Checked for repeated generic phrases, suspicious repetition, and citation weakness."
+            .to_string(),
+        "Use /ai/copyleaks/submit for premium plagiarism and historical-alignment scan."
+            .to_string(),
+        if score >= 50.0 {
+            "Risk is elevated. Rewrite generic sections and add citations for factual claims."
+                .to_string()
+        } else {
+            "No high-risk pattern found by the MVP checker, but source matching is not yet live."
+                .to_string()
+        },
     ];
 
     AiAnalyzeResponse {
@@ -215,7 +254,12 @@ fn run_plagiarism_checker(source_name: &str, text: &str, credit_cost: f64, refer
     }
 }
 
-fn run_humanizer(source_name: &str, text: &str, credit_cost: f64, reference: String) -> AiAnalyzeResponse {
+fn run_humanizer(
+    source_name: &str,
+    text: &str,
+    credit_cost: f64,
+    reference: String,
+) -> AiAnalyzeResponse {
     let humanized = humanize_text(text);
     AiAnalyzeResponse {
         title: "Humanized Draft".to_string(),
@@ -237,15 +281,31 @@ fn ai_pattern_score(text: &str) -> f64 {
     let sentence_count = text.matches('.').count().max(1) as f64;
     let word_count = text.split_whitespace().count() as f64;
     let avg_sentence = word_count / sentence_count;
-    let generic_markers = ["moreover", "furthermore", "in conclusion", "it is important", "overall", "delve", "landscape"];
-    let marker_hits = generic_markers.iter().filter(|marker| text.to_lowercase().contains(**marker)).count() as f64;
+    let generic_markers = [
+        "moreover",
+        "furthermore",
+        "in conclusion",
+        "it is important",
+        "overall",
+        "delve",
+        "landscape",
+    ];
+    let marker_hits = generic_markers
+        .iter()
+        .filter(|marker| text.to_lowercase().contains(**marker))
+        .count() as f64;
     let score = 25.0 + marker_hits * 12.0 + if avg_sentence > 24.0 { 20.0 } else { 5.0 };
     score.clamp(5.0, 95.0)
 }
 
 fn plagiarism_risk_score(text: &str) -> f64 {
-    let words = text.split_whitespace().map(|word| word.to_lowercase()).collect::<Vec<_>>();
-    if words.is_empty() { return 0.0; }
+    let words = text
+        .split_whitespace()
+        .map(|word| word.to_lowercase())
+        .collect::<Vec<_>>();
+    if words.is_empty() {
+        return 0.0;
+    }
     let unique = words.iter().collect::<std::collections::HashSet<_>>().len() as f64;
     let repetition_ratio = 1.0 - (unique / words.len() as f64);
     (repetition_ratio * 100.0).clamp(0.0, 90.0)

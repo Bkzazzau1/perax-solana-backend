@@ -957,6 +957,7 @@ pub async fn purchase_number(
     let resp_json: Value = response.json().await?;
     log_provider_transaction_with_economics(
         &state,
+        "telnyx",
         "order_number",
         Some(account.account_id),
         "telnyx_number_order",
