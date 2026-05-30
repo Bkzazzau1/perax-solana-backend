@@ -9,6 +9,7 @@ pub mod checkout;
 pub mod credits;
 pub mod payments;
 pub mod paystack;
+pub mod payscribe;
 pub mod pricing;
 pub mod protocol;
 pub mod solana;
