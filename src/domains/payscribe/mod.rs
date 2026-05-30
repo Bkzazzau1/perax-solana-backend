@@ -7,7 +7,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::{error::{GatewayError, GatewayResult}, state::AppState};
+use crate::{
+    domains::telecom::billing::{credit_credits, debit_credits},
+    error::{GatewayError, GatewayResult},
+    state::AppState,
+};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -41,7 +45,6 @@ struct DataVendRequest {
     plan: String,
     recipient: Value,
     ref_id: Option<String>,
-    charge_credits: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,11 +119,40 @@ async fn vend_data(
     Json(request): Json<DataVendRequest>,
 ) -> GatewayResult<Json<PayscribeTransactionRecord>> {
     validate_data_request(&request)?;
+    let account_id = request.account_id.ok_or_else(|| {
+        GatewayError::Upstream("accountId is required for Payscribe data vending".to_string())
+    })?;
+    let network = request.network.trim().to_lowercase();
+    let plan = request.plan.trim().to_string();
     let provider_reference = request.ref_id.clone().unwrap_or_else(|| format!("ps_data_{}", Uuid::new_v4().simple()));
 
+    let lookup = fetch_data_lookup(&state, &network).await?;
+    let plan_amount = find_plan_amount(&lookup, &plan).ok_or_else(|| {
+        GatewayError::Upstream("selected data plan was not found in Payscribe lookup response".to_string())
+    })?;
+    let charge_credits = calculate_data_charge_credits(plan_amount);
+
+    debit_credits(
+        &state,
+        account_id,
+        charge_credits,
+        "payscribe_data",
+        &provider_reference,
+        "Payscribe data bundle purchase",
+        json!({
+            "network": network,
+            "plan": plan,
+            "recipient": request.recipient,
+            "providerReference": provider_reference,
+            "planAmount": plan_amount,
+            "chargeCredits": charge_credits
+        }),
+    )
+    .await?;
+
     let payload = json!({
-        "network": request.network.trim().to_lowercase(),
-        "plan": request.plan.trim(),
+        "network": network,
+        "plan": plan,
         "recipient": request.recipient,
         "ref": provider_reference,
     });
@@ -130,6 +162,20 @@ async fn vend_data(
     let body: Value = response.json().await?;
     let provider_status = extract_transaction_status(&body, status.as_u16());
     let provider_trans_id = body["message"]["details"]["trans_id"].as_str().map(str::to_string);
+
+    let provider_accepted = status.is_success() && body.get("status").and_then(Value::as_bool).unwrap_or(false);
+    if !provider_accepted {
+        let _ = credit_credits(
+            &state,
+            account_id,
+            charge_credits,
+            "payscribe_data_reversal",
+            &provider_reference,
+            "Reversal for rejected Payscribe data vend",
+            json!({ "providerResponse": body }),
+        )
+        .await;
+    }
 
     let record = sqlx::query_as::<_, PayscribeTransactionRecord>(
         r#"
@@ -141,18 +187,19 @@ async fn vend_data(
             provider_status = excluded.provider_status,
             provider_trans_id = coalesce(excluded.provider_trans_id, payscribe_transactions.provider_trans_id),
             provider_payload = excluded.provider_payload,
+            charge_credits = excluded.charge_credits,
             updated_at = now()
         returning id, account_id, service_type, provider_reference, network, plan_code,
                   recipient, charge_credits::float8 as charge_credits, provider_status,
                   provider_trans_id, provider_payload, requery_payload
         "#,
     )
-    .bind(request.account_id)
+    .bind(account_id)
     .bind(&provider_reference)
-    .bind(request.network.trim().to_lowercase())
-    .bind(request.plan.trim())
+    .bind(network)
+    .bind(plan)
     .bind(payload.get("recipient").cloned().unwrap_or(Value::Null))
-    .bind(request.charge_credits)
+    .bind(charge_credits)
     .bind(provider_status)
     .bind(provider_trans_id)
     .bind(body)
@@ -215,6 +262,53 @@ fn validate_data_request(request: &DataVendRequest) -> GatewayResult<()> {
 
 fn is_supported_data_network(network: &str) -> bool {
     matches!(network, "mtn" | "glo" | "airtel" | "9mobile" | "smile" | "dstvshowmax")
+}
+
+async fn fetch_data_lookup(state: &AppState, network: &str) -> GatewayResult<Value> {
+    let response = payscribe_get(state, &format!("/data/lookup?network={network}")).await?;
+    let status = response.status();
+    let body: Value = response.json().await?;
+    if !status.is_success() {
+        return Err(GatewayError::Upstream(format!("Payscribe data lookup failed: {body}")));
+    }
+    Ok(body)
+}
+
+fn calculate_data_charge_credits(plan_amount: f64) -> f64 {
+    let credits_per_naira = std::env::var("PAYSCRIBE_DATA_CREDITS_PER_NAIRA")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| *value > 0.0)
+        .unwrap_or(1.0);
+    let service_fee = std::env::var("PAYSCRIBE_DATA_SERVICE_FEE_CREDITS")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| *value >= 0.0)
+        .unwrap_or(0.0);
+
+    ((plan_amount * credits_per_naira + service_fee) * 100.0).round() / 100.0
+}
+
+fn find_plan_amount(value: &Value, plan_code: &str) -> Option<f64> {
+    match value {
+        Value::Object(map) => {
+            let has_plan = map.values().any(|item| item.as_str() == Some(plan_code));
+            if has_plan {
+                for key in ["amount", "price", "fee", "charge"] {
+                    if let Some(amount) = map.get(key).and_then(value_to_f64) {
+                        return Some(amount);
+                    }
+                }
+            }
+            map.values().find_map(|child| find_plan_amount(child, plan_code))
+        }
+        Value::Array(items) => items.iter().find_map(|child| find_plan_amount(child, plan_code)),
+        _ => None,
+    }
+}
+
+fn value_to_f64(value: &Value) -> Option<f64> {
+    value.as_f64().or_else(|| value.as_str()?.parse::<f64>().ok())
 }
 
 async fn payscribe_post(state: &AppState, path: &str, payload: Value) -> GatewayResult<reqwest::Response> {
