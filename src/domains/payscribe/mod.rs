@@ -19,6 +19,8 @@ pub fn router() -> Router<AppState> {
         .route("/payscribe/data/lookup", get(data_lookup))
         .route("/payscribe/data/quote", get(data_quote))
         .route("/payscribe/data/vend", post(vend_data))
+        .route("/payscribe/electricity/status", get(electricity_status))
+        .route("/payscribe/electricity/validate", post(validate_electricity_customer))
         .route("/payscribe/requery", get(requery_transaction))
 }
 
@@ -29,6 +31,16 @@ struct PayscribeStatusResponse {
     base_url: String,
     api_key_configured: bool,
     supported_services: Vec<&'static str>,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ElectricityStatusResponse {
+    ready_for_validation: bool,
+    ready_for_vending: bool,
+    validation_path: String,
+    vend_path_configured: bool,
     message: String,
 }
 
@@ -68,6 +80,18 @@ struct DataVendRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ElectricityValidationRequest {
+    disco: Option<String>,
+    provider: Option<String>,
+    meter_number: Option<String>,
+    meter_no: Option<String>,
+    meter_type: Option<String>,
+    amount: Option<f64>,
+    customer_phone: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RequeryParams {
     trans_id: String,
 }
@@ -98,12 +122,24 @@ async fn payscribe_status() -> Json<PayscribeStatusResponse> {
         configured,
         base_url,
         api_key_configured: configured,
-        supported_services: vec!["data"],
+        supported_services: vec!["data", "electricity_validation"],
         message: if configured {
-            "Payscribe backend is configured for data vending.".to_string()
+            "Payscribe backend is configured for data vending and electricity customer validation.".to_string()
         } else {
-            "PAYSCRIBE_API_KEY is required before live data vending.".to_string()
+            "PAYSCRIBE_API_KEY is required before live Payscribe services.".to_string()
         },
+    })
+}
+
+async fn electricity_status() -> Json<ElectricityStatusResponse> {
+    let validation_path = payscribe_electricity_validate_path();
+    let vend_path = std::env::var("PAYSCRIBE_ELECTRICITY_VEND_PATH").unwrap_or_default();
+    Json(ElectricityStatusResponse {
+        ready_for_validation: !std::env::var("PAYSCRIBE_API_KEY").unwrap_or_default().trim().is_empty(),
+        ready_for_vending: false,
+        validation_path,
+        vend_path_configured: !vend_path.trim().is_empty(),
+        message: "Electricity validation foundation is active. Vending will be enabled after the exact Payscribe electricity vend payload is confirmed.".to_string(),
     })
 }
 
@@ -163,6 +199,40 @@ async fn data_quote(
             "serviceFeeCredits": payscribe_data_service_fee_credits()
         }),
     }))
+}
+
+async fn validate_electricity_customer(
+    State(state): State<AppState>,
+    Json(request): Json<ElectricityValidationRequest>,
+) -> GatewayResult<Json<Value>> {
+    let provider = request.disco.clone().or(request.provider.clone()).unwrap_or_default();
+    let meter_number = request.meter_number.clone().or(request.meter_no.clone()).unwrap_or_default();
+    if provider.trim().is_empty() {
+        return Err(GatewayError::Upstream("disco/provider is required for electricity validation".to_string()));
+    }
+    if meter_number.trim().is_empty() {
+        return Err(GatewayError::Upstream("meterNumber is required for electricity validation".to_string()));
+    }
+
+    let payload = json!({
+        "disco": provider,
+        "provider": request.provider,
+        "meter_number": meter_number,
+        "meter_no": request.meter_no,
+        "meter_type": request.meter_type,
+        "amount": request.amount,
+        "customer_phone": request.customer_phone
+    });
+    let response = payscribe_post(&state, &payscribe_electricity_validate_path(), payload.clone()).await?;
+    let status = response.status();
+    let body: Value = response.json().await?;
+
+    Ok(Json(json!({
+        "accepted": status.is_success(),
+        "providerStatus": status.as_u16(),
+        "requestPayload": payload,
+        "providerResponse": body
+    })))
 }
 
 async fn vend_data(
@@ -390,6 +460,10 @@ async fn payscribe_get(state: &AppState, path: &str) -> GatewayResult<reqwest::R
 
 fn payscribe_base_url() -> String {
     std::env::var("PAYSCRIBE_BASE_URL").unwrap_or_else(|_| "https://sandbox.payscribe.ng/api/v1".to_string())
+}
+
+fn payscribe_electricity_validate_path() -> String {
+    std::env::var("PAYSCRIBE_ELECTRICITY_VALIDATE_PATH").unwrap_or_else(|_| "/electricity/validate".to_string())
 }
 
 fn payscribe_token() -> GatewayResult<String> {
