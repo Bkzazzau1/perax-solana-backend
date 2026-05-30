@@ -90,6 +90,7 @@ pub fn router() -> Router<AppState> {
         .route("/ai/access/check", post(check_access))
         .route("/ai/documents/analyze", post(analyze_document))
         .merge(super::copy::router())
+        .merge(super::copyleaks::router())
 }
 
 async fn check_access(
@@ -198,7 +199,7 @@ fn run_plagiarism_checker(source_name: &str, text: &str, credit_cost: f64, refer
     let score = plagiarism_risk_score(text);
     let findings = vec![
         "Checked for repeated generic phrases, suspicious repetition, and citation weakness.".to_string(),
-        "Live web/source similarity matching will be connected through a plagiarism provider later.".to_string(),
+        "Use /ai/copyleaks/submit for premium plagiarism and historical-alignment scan.".to_string(),
         if score >= 50.0 { "Risk is elevated. Rewrite generic sections and add citations for factual claims.".to_string() } else { "No high-risk pattern found by the MVP checker, but source matching is not yet live.".to_string() },
     ];
 
@@ -208,7 +209,7 @@ fn run_plagiarism_checker(source_name: &str, text: &str, credit_cost: f64, refer
         score,
         credit_cost,
         findings,
-        output: "Recommendation: connect Copyleaks/another plagiarism API for production-grade source matching. MVP result is a writing-risk screen, not final proof of originality.".to_string(),
+        output: "Recommendation: use Copyleaks premium scan for production-grade plagiarism and historical-alignment checking.".to_string(),
         reference,
         engine: "heuristic_mvp".to_string(),
     }
