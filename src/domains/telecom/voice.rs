@@ -20,7 +20,8 @@ use crate::{
         auth::middleware::AuthenticatedAccount,
         pricing,
         telecom::billing::{
-            credit_balance, debit_credits, log_provider_transaction, round_credits,
+            credit_balance, debit_credits, estimate_telnyx_economics, log_provider_transaction,
+            round_credits, telnyx_voice_estimated_usd_cost,
         },
     },
     error::{GatewayError, GatewayResult},
@@ -818,6 +819,10 @@ async fn finalize_call_billing(state: &AppState, call_id: &str) -> GatewayResult
     let duration_seconds = (ended_at - started_at).num_seconds().max(0) as i32;
     let billed_minutes = ((duration_seconds as f64) / 60.0).ceil().max(1.0);
     let credits_charged = round_credits(billed_minutes * rate_per_minute);
+    let economics = estimate_telnyx_economics(
+        credits_charged,
+        telnyx_voice_estimated_usd_cost(billed_minutes),
+    );
     let source_reference = format!("telnyx_voice_call:{}", call.call_id);
 
     match debit_credits(
@@ -847,14 +852,22 @@ async fn finalize_call_billing(state: &AppState, call_id: &str) -> GatewayResult
                     billing_status = 'posted',
                     billing_ledger_id = $4,
                     billing_error = null,
+                    estimated_usd_cost = $5,
+                    provider_cost_currency = $6,
+                    margin_credits = $7,
+                    margin_usd = $8,
                     updated_at = now()
-                where call_id = $5
+                where call_id = $9
                 "#,
             )
             .bind(duration_seconds)
             .bind(billed_minutes)
             .bind(credits_charged)
             .bind(debit.ledger_id)
+            .bind(economics.estimated_usd_cost)
+            .bind(&economics.provider_cost_currency)
+            .bind(economics.margin_credits)
+            .bind(economics.margin_usd)
             .bind(&call.call_id)
             .execute(&state.db)
             .await?;

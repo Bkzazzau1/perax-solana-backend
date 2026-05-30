@@ -10,7 +10,10 @@ use crate::{
     domains::{
         auth::middleware::AuthenticatedAccount,
         telecom::billing::{
-            credit_balance, debit_credits, log_provider_transaction, round_credits,
+            TelnyxEconomics, credit_balance, credit_credits, debit_credits,
+            estimate_telnyx_economics, log_provider_transaction,
+            log_provider_transaction_with_economics, round_credits,
+            telnyx_number_estimated_usd_cost,
         },
     },
     error::{GatewayError, GatewayResult},
@@ -94,6 +97,10 @@ pub struct MyNumberRecord {
     pub status: String,
     pub setup_fee_credits: Option<f64>,
     pub monthly_fee_credits: Option<f64>,
+    pub estimated_usd_cost: Option<f64>,
+    pub provider_cost_currency: Option<String>,
+    pub margin_credits: Option<f64>,
+    pub margin_usd: Option<f64>,
     pub next_renewal_at: Option<chrono::DateTime<chrono::Utc>>,
     pub billing_status: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -109,6 +116,10 @@ pub struct MyNumberDto {
     pub status: String,
     pub setup_fee_credits: Option<f64>,
     pub monthly_fee_credits: Option<f64>,
+    pub estimated_usd_cost: Option<f64>,
+    pub provider_cost_currency: Option<String>,
+    pub margin_credits: Option<f64>,
+    pub margin_usd: Option<f64>,
     pub next_renewal_at: Option<chrono::DateTime<chrono::Utc>>,
     pub billing_status: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -255,6 +266,7 @@ pub async fn reserve_number_with_credits(
         monthly_fee
     };
     let credit_cost = round_credits(setup_fee + subscription_cost);
+    let economics = estimate_telnyx_economics(credit_cost, telnyx_number_estimated_usd_cost());
     let balance = credit_balance(&state, account.account_id).await?;
     let remaining_credits = round_credits(balance - credit_cost);
     let confirmed = credit_cost > 0.0 && remaining_credits >= 0.0;
@@ -289,6 +301,7 @@ pub async fn reserve_number_with_credits(
             setup_fee,
             monthly_fee,
             next_renewal_at,
+            &economics,
         )
         .await?;
     }
@@ -330,6 +343,10 @@ pub async fn list_my_numbers(
                status,
                setup_fee_credits::double precision as setup_fee_credits,
                monthly_fee_credits::double precision as monthly_fee_credits,
+               estimated_usd_cost::double precision as estimated_usd_cost,
+               provider_cost_currency,
+               margin_credits::double precision as margin_credits,
+               margin_usd::double precision as margin_usd,
                next_renewal_at,
                billing_status,
                created_at
@@ -585,6 +602,8 @@ pub async fn purchase_number(
 ) -> GatewayResult<Json<ProvisioningResponse>> {
     let phone_number = normalize_phone_number(&payload.phone_number)?;
     let source_reference = format!("telnyx_number_order:{}", Uuid::new_v4().simple());
+    let economics =
+        estimate_telnyx_economics(NUMBER_SETUP_COST, telnyx_number_estimated_usd_cost());
     debit_credits(
         &state,
         account.account_id,
@@ -616,13 +635,28 @@ pub async fn purchase_number(
             Some(&err_text),
         )
         .await?;
+        credit_credits(
+            &state,
+            account.account_id,
+            NUMBER_SETUP_COST,
+            "telnyx_number_order_reversal",
+            &format!("{source_reference}:provider_rejected"),
+            "Reversal for rejected Telnyx number order",
+            serde_json::json!({
+                "originalSourceReference": source_reference,
+                "phoneNumber": phone_number,
+                "providerStatus": http_status.as_u16(),
+                "providerError": err_text.clone()
+            }),
+        )
+        .await?;
         return Err(GatewayError::Upstream(format!(
             "Telnyx number provisioning failed: {err_text}"
         )));
     }
 
     let resp_json: Value = response.json().await?;
-    log_provider_transaction(
+    log_provider_transaction_with_economics(
         &state,
         "order_number",
         Some(account.account_id),
@@ -633,6 +667,7 @@ pub async fn purchase_number(
         Some(http_status.as_u16()),
         true,
         None,
+        Some(&economics),
     )
     .await?;
     let order_id = resp_json["data"]["id"]
@@ -650,6 +685,7 @@ pub async fn purchase_number(
         &phone_number,
         &order_id,
         &status,
+        &economics,
     )
     .await?;
 
@@ -702,6 +738,7 @@ async fn save_reserved_number(
     setup_fee_credits: f64,
     monthly_fee_credits: f64,
     next_renewal_at: chrono::DateTime<chrono::Utc>,
+    economics: &TelnyxEconomics,
 ) -> GatewayResult<()> {
     sqlx::query(
         r#"
@@ -716,9 +753,13 @@ async fn save_reserved_number(
             setup_fee_credits,
             monthly_fee_credits,
             next_renewal_at,
-            billing_status
+            billing_status,
+            estimated_usd_cost,
+            provider_cost_currency,
+            margin_credits,
+            margin_usd
         )
-        values (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, 'active')
+        values (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, 'active', $10, $11, $12, $13)
         on conflict (phone_number) do update
         set account_id = excluded.account_id,
             telnyx_order_id = excluded.telnyx_order_id,
@@ -729,6 +770,10 @@ async fn save_reserved_number(
             monthly_fee_credits = excluded.monthly_fee_credits,
             next_renewal_at = excluded.next_renewal_at,
             billing_status = excluded.billing_status,
+            estimated_usd_cost = excluded.estimated_usd_cost,
+            provider_cost_currency = excluded.provider_cost_currency,
+            margin_credits = excluded.margin_credits,
+            margin_usd = excluded.margin_usd,
             updated_at = now()
         "#,
     )
@@ -741,6 +786,10 @@ async fn save_reserved_number(
     .bind(setup_fee_credits)
     .bind(monthly_fee_credits)
     .bind(next_renewal_at)
+    .bind(economics.estimated_usd_cost)
+    .bind(&economics.provider_cost_currency)
+    .bind(economics.margin_credits)
+    .bind(economics.margin_usd)
     .execute(&state.db)
     .await?;
 
@@ -753,15 +802,30 @@ async fn save_provisioned_number(
     phone_number: &str,
     order_id: &str,
     status: &str,
+    economics: &TelnyxEconomics,
 ) -> GatewayResult<()> {
     sqlx::query(
         r#"
-        insert into provisioned_numbers (id, account_id, phone_number, telnyx_order_id, status)
-        values (gen_random_uuid(), $1, $2, $3, $4)
+        insert into provisioned_numbers (
+            id,
+            account_id,
+            phone_number,
+            telnyx_order_id,
+            status,
+            estimated_usd_cost,
+            provider_cost_currency,
+            margin_credits,
+            margin_usd
+        )
+        values (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8)
         on conflict (phone_number) do update
         set account_id = excluded.account_id,
             telnyx_order_id = excluded.telnyx_order_id,
             status = excluded.status,
+            estimated_usd_cost = excluded.estimated_usd_cost,
+            provider_cost_currency = excluded.provider_cost_currency,
+            margin_credits = excluded.margin_credits,
+            margin_usd = excluded.margin_usd,
             updated_at = now()
         "#,
     )
@@ -769,6 +833,10 @@ async fn save_provisioned_number(
     .bind(phone_number)
     .bind(order_id)
     .bind(status)
+    .bind(economics.estimated_usd_cost)
+    .bind(&economics.provider_cost_currency)
+    .bind(economics.margin_credits)
+    .bind(economics.margin_usd)
     .execute(&state.db)
     .await?;
 
@@ -857,6 +925,10 @@ impl From<MyNumberRecord> for MyNumberDto {
             status: value.status,
             setup_fee_credits: value.setup_fee_credits,
             monthly_fee_credits: value.monthly_fee_credits,
+            estimated_usd_cost: value.estimated_usd_cost,
+            provider_cost_currency: value.provider_cost_currency,
+            margin_credits: value.margin_credits,
+            margin_usd: value.margin_usd,
             next_renewal_at: value.next_renewal_at,
             billing_status: value.billing_status,
             created_at: value.created_at,

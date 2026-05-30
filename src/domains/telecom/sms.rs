@@ -14,7 +14,11 @@ use crate::{
         auth::middleware::AuthenticatedAccount,
         pricing,
         telecom::{
-            billing::{debit_credits, log_provider_transaction, round_credits},
+            billing::{
+                credit_credits, debit_credits, estimate_telnyx_economics, log_provider_transaction,
+                log_provider_transaction_with_economics, round_credits,
+                telnyx_sms_estimated_usd_cost,
+            },
             voice::verify_telnyx_webhook,
         },
     },
@@ -101,6 +105,8 @@ pub async fn send_sms(
     let sms_price = pricing::get_utility_price(&state, "sms_outbound").await?;
     let cost_per_segment = sms_price.credit_cost;
     let total_sms_cost = round_credits((parts_billed as f64) * cost_per_segment);
+    let economics =
+        estimate_telnyx_economics(total_sms_cost, telnyx_sms_estimated_usd_cost(parts_billed));
     let source_reference = format!("sms_{}", Uuid::new_v4().simple());
     let debit = debit_credits(
         &state,
@@ -147,6 +153,20 @@ pub async fn send_sms(
             Some(&err_text),
         )
         .await?;
+        credit_credits(
+            &state,
+            account.account_id,
+            total_sms_cost,
+            "telnyx_sms_reversal",
+            &format!("{source_reference}:provider_rejected"),
+            "Reversal for rejected Telnyx SMS",
+            serde_json::json!({
+                "originalSourceReference": source_reference,
+                "providerStatus": status.as_u16(),
+                "providerError": err_text.clone()
+            }),
+        )
+        .await?;
 
         return Err(GatewayError::Upstream(format!(
             "Telnyx messaging infrastructure failure: {err_text}"
@@ -158,7 +178,7 @@ pub async fn send_sms(
         .as_str()
         .unwrap_or("unknown_carrier_id")
         .to_string();
-    log_provider_transaction(
+    log_provider_transaction_with_economics(
         &state,
         "send_sms",
         Some(account.account_id),
@@ -169,6 +189,7 @@ pub async fn send_sms(
         Some(status.as_u16()),
         true,
         None,
+        Some(&economics),
     )
     .await?;
 
