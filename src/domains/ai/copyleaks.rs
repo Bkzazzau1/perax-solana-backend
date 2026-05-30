@@ -21,7 +21,7 @@ pub fn router() -> Router<AppState> {
         .route("/ai/copyleaks/quote", post(copyleaks_quote))
         .route("/ai/copyleaks/submit", post(copyleaks_submit))
         .route("/ai/copyleaks/webhook", post(copyleaks_webhook))
-        .route("/ai/copyleaks/result/:reference", get(copyleaks_result))
+        .route("/ai/copyleaks/result/{reference}", get(copyleaks_result))
 }
 
 #[derive(Debug, Serialize)]
