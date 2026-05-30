@@ -131,6 +131,13 @@ pub struct CallActionResponse {
     pub provider_response: Value,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenericCallActionRequest {
+    #[serde(default)]
+    pub payload: Value,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceWebhookResponse {
@@ -522,7 +529,15 @@ pub async fn speak_call(
         "language": request.language.unwrap_or_else(|| "en-US".to_string()),
         "command_id": format!("cmd_{}", Uuid::new_v4().simple()),
     });
-    post_call_action(&state, &call.call_id, &call_control_id, "speak", payload).await
+    post_call_action(
+        &state,
+        Some(account.account_id),
+        &call.call_id,
+        &call_control_id,
+        "speak",
+        payload,
+    )
+    .await
 }
 
 pub async fn record_call(
@@ -543,6 +558,7 @@ pub async fn record_call(
     });
     post_call_action(
         &state,
+        Some(account.account_id),
         &call.call_id,
         &call_control_id,
         "record_start",
@@ -564,11 +580,57 @@ pub async fn hangup_call(
     let payload = json!({
         "command_id": format!("cmd_{}", Uuid::new_v4().simple()),
     });
-    post_call_action(&state, &call.call_id, &call_control_id, "hangup", payload).await
+    post_call_action(
+        &state,
+        Some(account.account_id),
+        &call.call_id,
+        &call_control_id,
+        "hangup",
+        payload,
+    )
+    .await
+}
+
+pub async fn send_call_action(
+    State(state): State<AppState>,
+    account: AuthenticatedAccount,
+    Path((id, action)): Path<(String, String)>,
+    Json(request): Json<GenericCallActionRequest>,
+) -> GatewayResult<Json<CallActionResponse>> {
+    let call = find_call(&state, &id).await?;
+    if call.account_id != Some(account.account_id) {
+        return Err(GatewayError::Unauthorized);
+    }
+    let action = normalize_call_action(&action)?;
+    let call_control_id = call_control_id(&call)?;
+    let mut payload = match request.payload {
+        Value::Object(map) => Value::Object(map),
+        Value::Null => json!({}),
+        _ => {
+            return Err(GatewayError::Upstream(
+                "call action payload must be a JSON object".to_string(),
+            ));
+        }
+    };
+    if let Some(map) = payload.as_object_mut() {
+        map.entry("command_id")
+            .or_insert_with(|| Value::String(format!("cmd_{}", Uuid::new_v4().simple())));
+    }
+
+    post_call_action(
+        &state,
+        Some(account.account_id),
+        &call.call_id,
+        &call_control_id,
+        &action,
+        payload,
+    )
+    .await
 }
 
 async fn post_call_action(
     state: &AppState,
+    account_id: Option<Uuid>,
     call_id: &str,
     call_control_id: &str,
     action: &str,
@@ -583,7 +645,7 @@ async fn post_call_action(
         log_provider_transaction(
             state,
             action,
-            None,
+            account_id,
             "telnyx_voice_call",
             call_id,
             Some(payload),
@@ -601,7 +663,7 @@ async fn post_call_action(
     log_provider_transaction(
         state,
         action,
-        None,
+        account_id,
         "telnyx_voice_call",
         call_id,
         Some(payload),
@@ -934,13 +996,75 @@ fn call_control_id(call: &VoiceCallRecord) -> GatewayResult<String> {
         .ok_or_else(|| GatewayError::Upstream("call_control_id is not available yet".to_string()))
 }
 
+fn normalize_call_action(action: &str) -> GatewayResult<String> {
+    let action = action.trim().to_lowercase().replace('-', "_");
+    let allowed = matches!(
+        action.as_str(),
+        "answer"
+            | "fork_start"
+            | "fork_stop"
+            | "hangup"
+            | "reject"
+            | "transfer"
+            | "suppression_start"
+            | "suppression_stop"
+            | "client_state_update"
+            | "bridge"
+            | "ai_assistant_start"
+            | "ai_assistant_stop"
+            | "enqueue"
+            | "leave_queue"
+            | "gather_using_audio"
+            | "gather_using_speak"
+            | "gather_using_ai"
+            | "gather_stop"
+            | "playback_start"
+            | "playback_stop"
+            | "record_start"
+            | "record_stop"
+            | "record_pause"
+            | "record_resume"
+            | "refer"
+            | "send_dtmf"
+            | "send_sip_info"
+            | "speak"
+            | "streaming_start"
+            | "streaming_stop"
+            | "transcription_start"
+            | "transcription_stop"
+            | "siprec_start"
+            | "siprec_stop"
+    );
+
+    if allowed {
+        Ok(action)
+    } else {
+        Err(GatewayError::Upstream(format!(
+            "unsupported Telnyx call action: {action}"
+        )))
+    }
+}
+
 fn status_for_event(event_type: &str) -> &'static str {
     match event_type {
         "call.initiated" => "initiated",
         "call.answered" => "answered",
+        "call.hold" => "held",
+        "call.unhold" => "answered",
         "call.hangup" => "completed",
         "call.bridged" => "bridged",
+        "call.playback.started" => "playback_started",
+        "call.playback.ended" => "playback_ended",
+        "call.speak.started" => "speak_started",
+        "call.speak.ended" => "speak_ended",
+        "call.gather.ended" => "gather_ended",
         "call.recording.saved" => "recorded",
+        "call.fork.started" => "fork_started",
+        "call.fork.stopped" => "fork_stopped",
+        "call.enqueued" => "enqueued",
+        "call.dequeued" => "dequeued",
+        "streaming.started" => "streaming_started",
+        "streaming.stopped" => "streaming_stopped",
         _ => "updated",
     }
 }

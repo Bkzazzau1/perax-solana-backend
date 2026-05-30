@@ -17,6 +17,10 @@ pub fn router() -> Router<AppState> {
         .route("/telecom/calls/{id}/speak", post(voice::speak_call))
         .route("/telecom/calls/{id}/record", post(voice::record_call))
         .route("/telecom/calls/{id}/hangup", post(voice::hangup_call))
+        .route(
+            "/telecom/calls/{id}/actions/{action}",
+            post(voice::send_call_action),
+        )
         .route("/telecom/voice/webhook", post(voice::receive_voice_webhook))
         .route("/telecom/webrtc/offer", post(voice::create_offer))
         .route("/telecom/sms", post(sms::send_sms))
