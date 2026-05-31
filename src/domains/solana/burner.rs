@@ -7,12 +7,15 @@ use uuid::Uuid;
 
 use crate::{error::GatewayError, state::AppState};
 
+const DEFAULT_BURN_SOURCE: &str = "OpenMarketPurchase";
+
 pub fn spawn_daily_burner(state: AppState) {
     tokio::spawn(async move {
         let interval = daily_burner_interval();
 
         info!(
             revenue_account = %state.config.trading_company_second_wallet,
+            trading_treasury = %state.config.trading_co_treasury,
             burn_execution_mode = %state.config.burn_execution_mode.as_str(),
             interval_seconds = %interval.as_secs(),
             "Starting PEX automatic system-controlled daily burn worker"
@@ -83,8 +86,9 @@ async fn inspect_daily_realized_burn_schedule(state: &AppState) -> Result<(), Ga
             burn_rate_bps = %params.burn_rate_bps,
             market_health_score = %params.market_health_score,
             observed_at = %params.observed_at,
+            burn_source = %params.burn_source,
             burn_execution_mode = %state.config.burn_execution_mode.as_str(),
-            "Daily burn is ready for automatic execute_market_condition_burn smart-contract execution."
+            "Daily burn is ready for automatic execute_conditional_buyback_burn smart-contract execution."
         );
 
         // Disabled mode means: prepare and log only. No on-chain execution.
@@ -106,7 +110,7 @@ async fn inspect_daily_realized_burn_schedule(state: &AppState) -> Result<(), Ga
                     burn_id = %burn.id,
                     signature = %result.signature,
                     burn_record = %result.burn_record,
-                    "Automatic daily market-condition burn executed and recorded."
+                    "Automatic daily conditional buyback burn executed and recorded."
                 );
             }
             Err(err) => {
@@ -138,6 +142,7 @@ struct ContractBurnParams {
     burn_rate_bps: u16,
     market_health_score: u8,
     observed_at: i64,
+    burn_source: String,
 }
 
 #[derive(Debug)]
@@ -186,6 +191,7 @@ impl ContractBurnParams {
             burn_rate_bps,
             market_health_score,
             observed_at,
+            burn_source: DEFAULT_BURN_SOURCE.to_string(),
         })
     }
 }
@@ -196,7 +202,7 @@ async fn execute_contract_burn(
 ) -> Result<ContractBurnResult, GatewayError> {
     let executor_url = env::var("PERAX_SUPPLY_CONTROL_EXECUTOR_URL")
         .or_else(|_| env::var("PERAX_BURN_EXECUTOR_URL"))
-        .map(|value| value.trim().to_string())
+        .map(|value| value.trim().trim_end_matches('/').to_string())
         .ok()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
@@ -206,12 +212,22 @@ async fn execute_contract_burn(
             )
         })?;
 
+    let executor_url = if executor_url.ends_with("/execute/market-condition-burn")
+        || executor_url.ends_with("/execute/conditional-buyback-burn")
+    {
+        executor_url
+    } else {
+        format!("{executor_url}/execute/conditional-buyback-burn")
+    };
+
     let payload = serde_json::json!({
         "solanaRpcUrl": state.config.solana_rpc_url,
         "programId": state.config.perax_program_id,
         "statePda": state.config.perax_state_pda,
         "pexMintAddress": state.config.pex_mint_address,
+        "tradingCompanyTokenAccount": state.config.trading_co_treasury,
         "tradingCompanyRevenueTokenAccount": state.config.trading_company_second_wallet,
+        "burnSource": params.burn_source,
         "decisionIdHex": params.decision_id_hex,
         "amountBaseUnits": params.amount,
         "eligibleRevenueBaseUnits": params.eligible_revenue_amount,
@@ -280,7 +296,6 @@ async fn mark_burn_submitted(state: &AppState, burn_id: Uuid) -> Result<(), Gate
     .bind(burn_id)
     .execute(&state.db)
     .await?;
-
     Ok(())
 }
 
@@ -293,15 +308,13 @@ async fn mark_burn_executed(
     sqlx::query(
         r#"
         update pex_daily_realized_burns
-        set
-            burn_status = 'executed',
+        set burn_status = 'executed',
             onchain_tx_signature = $2,
-            burn_tx_signature = $2,
             onchain_burn_record = $3,
             executed_at = now(),
             execution_error = null,
             updated_at = now()
-        where id = $1 and burn_status = 'submitted'
+        where id = $1
         "#,
     )
     .bind(burn_id)
@@ -309,30 +322,6 @@ async fn mark_burn_executed(
     .bind(burn_record)
     .execute(&state.db)
     .await?;
-
-    Ok(())
-}
-
-async fn mark_burn_failed(
-    state: &AppState,
-    burn_id: Uuid,
-    reason: &str,
-) -> Result<(), GatewayError> {
-    sqlx::query(
-        r#"
-        update pex_daily_realized_burns
-        set
-            burn_status = 'failed',
-            execution_error = $2,
-            updated_at = now()
-        where id = $1 and burn_status = 'scheduled'
-        "#,
-    )
-    .bind(burn_id)
-    .bind(reason)
-    .execute(&state.db)
-    .await?;
-
     Ok(())
 }
 
@@ -344,10 +333,7 @@ async fn mark_burn_failed_from_submitted(
     sqlx::query(
         r#"
         update pex_daily_realized_burns
-        set
-            burn_status = 'failed',
-            execution_error = $2,
-            updated_at = now()
+        set burn_status = 'failed', execution_error = $2, updated_at = now()
         where id = $1 and burn_status = 'submitted'
         "#,
     )
@@ -355,26 +341,42 @@ async fn mark_burn_failed_from_submitted(
     .bind(reason)
     .execute(&state.db)
     .await?;
-
     Ok(())
 }
 
-fn pex_to_minor_units(amount_pex: f64) -> u64 {
-    if !amount_pex.is_finite() || amount_pex <= 0.0 {
-        return 0;
-    }
+async fn mark_burn_failed(
+    state: &AppState,
+    burn_id: Uuid,
+    reason: &str,
+) -> Result<(), GatewayError> {
+    sqlx::query(
+        r#"
+        update pex_daily_realized_burns
+        set burn_status = 'failed', execution_error = $2, updated_at = now()
+        where id = $1
+        "#,
+    )
+    .bind(burn_id)
+    .bind(reason)
+    .execute(&state.db)
+    .await?;
+    Ok(())
+}
 
-    (amount_pex * 1_000_000.0)
-        .round()
-        .clamp(0.0, u64::MAX as f64) as u64
+fn pex_to_minor_units(amount: f64) -> u64 {
+    let scaled = (amount * 1_000_000.0).round();
+    if scaled <= 0.0 {
+        0
+    } else {
+        scaled as u64
+    }
 }
 
 fn validate_decision_id_hex(value: &str) -> Result<(), GatewayError> {
-    if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+    if value.len() != 64 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(GatewayError::Config(
-            "decision_id_hex must be 32 bytes / 64 hex characters".to_string(),
+            "decision_id_hex must be 64 hex characters".to_string(),
         ));
     }
-
     Ok(())
 }
