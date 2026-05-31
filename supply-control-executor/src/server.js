@@ -22,6 +22,8 @@ const DEFAULT_RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.devnet.solana
 const EXECUTOR_TOKEN = process.env.PERAX_SUPPLY_CONTROL_EXECUTOR_TOKEN || '';
 const AUTHORITY_KEYPAIR_PATH = process.env.PERAX_AUTHORITY_KEYPAIR_PATH || '';
 const TRADING_COMPANY_AUTHORITY_KEYPAIR_PATH = process.env.TRADING_COMPANY_AUTHORITY_KEYPAIR_PATH || '';
+const TRADING_COMPANY_TOKEN_ACCOUNT = process.env.TRADING_COMPANY_TOKEN_ACCOUNT || process.env.TRADING_CO_TREASURY || '';
+const TRADING_COMPANY_REVENUE_TOKEN_ACCOUNT = process.env.TRADING_COMPANY_REVENUE_TOKEN_ACCOUNT || process.env.TRADING_COMPANY_SECOND_WALLET || '';
 
 function loadDotenv() {
   const envUrl = new URL('../.env', import.meta.url);
@@ -119,6 +121,10 @@ function u16Le(value) {
   return buffer;
 }
 
+function u8(value) {
+  return Buffer.from([Number(value)]);
+}
+
 function i64Le(value) {
   const buffer = Buffer.alloc(8);
   buffer.writeBigInt64LE(BigInt(value));
@@ -137,19 +143,67 @@ function instructionDiscriminator(name) {
   return crypto.createHash('sha256').update(`global:${name}`).digest().subarray(0, 8);
 }
 
-function encodeMarketConditionBurnParams(payload) {
-  const amount = Number(payload.amountBaseUnits);
-
-  if (!Number.isSafeInteger(amount) || amount <= 0) {
-    throw new Error('amountBaseUnits must be a positive safe integer');
+function toPositiveSafeInteger(value, label) {
+  const numberValue = Number(value);
+  if (!Number.isSafeInteger(numberValue) || numberValue <= 0) {
+    throw new Error(`${label} must be a positive safe integer`);
   }
+  return numberValue;
+}
 
+function toBps(value, label) {
+  const numberValue = Number(value);
+  if (!Number.isInteger(numberValue) || numberValue < 0 || numberValue > 10000) {
+    throw new Error(`${label} must be an integer between 0 and 10000`);
+  }
+  return numberValue;
+}
+
+function toMarketHealthScore(value) {
+  const numberValue = Number(value);
+  if (!Number.isInteger(numberValue) || numberValue < 0 || numberValue > 100) {
+    throw new Error('marketHealthScore must be an integer between 0 and 100');
+  }
+  return numberValue;
+}
+
+function toObservedAt(value) {
+  const numberValue = Number(value);
+  if (!Number.isSafeInteger(numberValue) || numberValue <= 0) {
+    throw new Error('observedAtUnix must be a positive unix timestamp');
+  }
+  return numberValue;
+}
+
+function normalizeBurnSource(value) {
+  const normalized = String(value || 'OpenMarketPurchase').trim().toLowerCase();
+  if (['open_market_purchase', 'openmarketpurchase', 'revenue', 'revenue_account'].includes(normalized)) {
+    return { label: 'OpenMarketPurchase', enumIndex: 0 };
+  }
+  if (['trading_treasury', 'tradingtreasury', 'treasury', 'locked'].includes(normalized)) {
+    return { label: 'TradingTreasury', enumIndex: 1 };
+  }
+  throw new Error('burnSource must be OpenMarketPurchase or TradingTreasury');
+}
+
+function encodeConditionalBuybackBurnParams(payload) {
+  const amount = toPositiveSafeInteger(payload.amountBaseUnits, 'amountBaseUnits');
+  const eligibleRevenueAmount = toPositiveSafeInteger(payload.eligibleRevenueBaseUnits, 'eligibleRevenueBaseUnits');
+  const burnRateBps = toBps(payload.burnRateBps, 'burnRateBps');
+  const marketHealthScore = toMarketHealthScore(payload.marketHealthScore);
+  const observedAt = toObservedAt(payload.observedAtUnix);
   const decisionId = hexTo32Bytes(payload.decisionIdHex, 'decisionIdHex');
+  const burnSource = normalizeBurnSource(payload.burnSource);
 
   return Buffer.concat([
-    instructionDiscriminator('burn_from_trading_company'),
+    instructionDiscriminator('execute_conditional_buyback_burn'),
     u64Le(amount),
+    u64Le(eligibleRevenueAmount),
+    u16Le(burnRateBps),
+    u8(marketHealthScore),
+    i64Le(observedAt),
     decisionId,
+    u8(burnSource.enumIndex),
   ]);
 }
 
@@ -157,12 +211,24 @@ function deriveStatePda(programId) {
   return PublicKey.findProgramAddressSync([Buffer.from('perax-state')], programId)[0];
 }
 
+function deriveBurnRecordPda(programId, decisionIdHex) {
+  const decisionId = hexTo32Bytes(decisionIdHex, 'decisionIdHex');
+  return PublicKey.findProgramAddressSync([Buffer.from('burn'), decisionId], programId)[0];
+}
+
+function sourceTokenAccountForBurnSource(payload, burnSource) {
+  if (burnSource.label === 'OpenMarketPurchase') {
+    return payload.tradingCompanyRevenueTokenAccount || TRADING_COMPANY_REVENUE_TOKEN_ACCOUNT;
+  }
+  return payload.tradingCompanyTokenAccount || TRADING_COMPANY_TOKEN_ACCOUNT;
+}
+
 async function executeBurn(payload) {
   const rpcUrl = payload.solanaRpcUrl || DEFAULT_RPC_URL;
   const connection = new Connection(rpcUrl, 'confirmed');
 
   const authority = loadKeypair(AUTHORITY_KEYPAIR_PATH, 'authority');
-  const tradingCompanyAuthority = loadKeypair(
+  const sourceAuthority = loadKeypair(
     TRADING_COMPANY_AUTHORITY_KEYPAIR_PATH,
     'trading company authority',
   );
@@ -175,52 +241,68 @@ async function executeBurn(payload) {
     throw new Error('statePda does not match derived perax-state PDA');
   }
 
-  const tradingCompanyRevenueTokenAccount = new PublicKey(payload.tradingCompanyRevenueTokenAccount);
-  const revenueTokenAccountState = await getAccount(
+  const burnSource = normalizeBurnSource(payload.burnSource);
+  const sourceTokenAccountValue = sourceTokenAccountForBurnSource(payload, burnSource);
+  if (!sourceTokenAccountValue) {
+    throw new Error(
+      burnSource.label === 'OpenMarketPurchase'
+        ? 'tradingCompanyRevenueTokenAccount is required for OpenMarketPurchase burns'
+        : 'tradingCompanyTokenAccount is required for TradingTreasury burns',
+    );
+  }
+
+  const sourceTokenAccount = new PublicKey(sourceTokenAccountValue);
+  const sourceTokenAccountState = await getAccount(
     connection,
-    tradingCompanyRevenueTokenAccount,
+    sourceTokenAccount,
     'confirmed',
     TOKEN_PROGRAM_ID,
   );
 
-  if (!revenueTokenAccountState.owner.equals(tradingCompanyAuthority.publicKey)) {
-    throw new Error('tradingCompanyRevenueTokenAccount owner does not match trading company authority');
+  if (!sourceTokenAccountState.owner.equals(sourceAuthority.publicKey)) {
+    throw new Error('source token account owner does not match trading company authority');
   }
 
-  if (!revenueTokenAccountState.mint.equals(tokenMint)) {
-    throw new Error('tradingCompanyRevenueTokenAccount mint does not match PEX mint');
+  if (!sourceTokenAccountState.mint.equals(tokenMint)) {
+    throw new Error('source token account mint does not match PEX mint');
   }
 
-  if (revenueTokenAccountState.amount < BigInt(payload.amountBaseUnits)) {
-    throw new Error('tradingCompanyRevenueTokenAccount balance is lower than requested burn amount');
+  if (sourceTokenAccountState.amount < BigInt(payload.amountBaseUnits)) {
+    throw new Error('source token account balance is lower than requested burn amount');
   }
+
+  const burnRecordPda = deriveBurnRecordPda(programId, payload.decisionIdHex);
 
   const instruction = new TransactionInstruction({
     programId,
     keys: [
-      { pubkey: statePda, isSigner: false, isWritable: false },
+      { pubkey: statePda, isSigner: false, isWritable: true },
       { pubkey: authority.publicKey, isSigner: true, isWritable: true },
-      { pubkey: tradingCompanyAuthority.publicKey, isSigner: true, isWritable: false },
-      { pubkey: tradingCompanyRevenueTokenAccount, isSigner: false, isWritable: true },
+      { pubkey: sourceAuthority.publicKey, isSigner: true, isWritable: false },
+      { pubkey: burnRecordPda, isSigner: false, isWritable: true },
+      { pubkey: sourceTokenAccount, isSigner: false, isWritable: true },
       { pubkey: tokenMint, isSigner: false, isWritable: true },
       { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],
-    data: encodeMarketConditionBurnParams(payload),
+    data: encodeConditionalBuybackBurnParams(payload),
   });
 
   const transaction = new Transaction().add(instruction);
   const signature = await sendAndConfirmTransaction(
     connection,
     transaction,
-    [authority, tradingCompanyAuthority],
+    [authority, sourceAuthority],
     { commitment: 'confirmed' },
   );
 
   return {
     signature,
-    burnRecord: String(payload.decisionIdHex).trim().replace(/^0x/i, '').toLowerCase(),
+    burnRecord: burnRecordPda.toBase58(),
+    burnSource: burnSource.label,
+    sourceTokenAccount: sourceTokenAccount.toBase58(),
     authority: authority.publicKey.toBase58(),
-    tradingCompanyAuthority: tradingCompanyAuthority.publicKey.toBase58(),
+    tradingCompanyAuthority: sourceAuthority.publicKey.toBase58(),
   };
 }
 
@@ -230,7 +312,12 @@ const server = http.createServer(async (req, res) => {
       return jsonResponse(res, 200, { ok: true, service: 'perax-supply-control-executor' });
     }
 
-    if (req.method !== 'POST' || req.url !== '/execute/market-condition-burn') {
+    const supportedPaths = new Set([
+      '/execute/market-condition-burn',
+      '/execute/conditional-buyback-burn',
+    ]);
+
+    if (req.method !== 'POST' || !supportedPaths.has(req.url)) {
       return jsonResponse(res, 404, { error: 'not found' });
     }
 
@@ -242,6 +329,8 @@ const server = http.createServer(async (req, res) => {
       accepted: true,
       signature: result.signature,
       burnRecord: result.burnRecord,
+      burnSource: result.burnSource,
+      sourceTokenAccount: result.sourceTokenAccount,
       authority: result.authority,
       tradingCompanyAuthority: result.tradingCompanyAuthority,
     });
