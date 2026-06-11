@@ -19,6 +19,8 @@ pub enum GatewayError {
     Io(#[from] std::io::Error),
     #[error("unauthorized")]
     Unauthorized,
+    #[error("bad request: {0}")]
+    BadRequest(String),
     #[error("insufficient credits")]
     InsufficientCredits,
     #[error("upstream error: {0}")]
@@ -35,6 +37,7 @@ impl IntoResponse for GatewayError {
             Self::Http(_) => StatusCode::BAD_GATEWAY,
             Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::InsufficientCredits => StatusCode::PAYMENT_REQUIRED,
             Self::Upstream(_) => StatusCode::BAD_GATEWAY,
         };

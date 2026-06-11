@@ -365,11 +365,7 @@ async fn mark_burn_failed(
 
 fn pex_to_minor_units(amount: f64) -> u64 {
     let scaled = (amount * 1_000_000.0).round();
-    if scaled <= 0.0 {
-        0
-    } else {
-        scaled as u64
-    }
+    if scaled <= 0.0 { 0 } else { scaled as u64 }
 }
 
 fn validate_decision_id_hex(value: &str) -> Result<(), GatewayError> {

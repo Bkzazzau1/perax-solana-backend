@@ -152,6 +152,8 @@ pub struct VoiceWebhookResponse {
 #[serde(rename_all = "camelCase")]
 pub struct EndCallRequest {
     pub call_id: String,
+    pub duration_seconds: Option<i64>,
+    pub rate_per_minute: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -196,8 +198,22 @@ pub async fn start_call_session(
         && rate_per_minute > 0.0
         && balance >= rate_per_minute;
 
+    let call_id = format!("call_{}", Uuid::new_v4());
+
+    if can_start {
+        create_app_call_session(
+            &state,
+            account.account_id,
+            &call_id,
+            &payload.phone_number,
+            service_code,
+            rate_per_minute,
+        )
+        .await?;
+    }
+
     Ok(Json(StartCallResponse {
-        call_id: format!("call_{}", Uuid::new_v4()),
+        call_id,
         status: if can_start {
             "accepted".to_string()
         } else {
@@ -230,6 +246,19 @@ pub async fn end_call_session(
     if call.account_id != Some(account.account_id) {
         return Err(GatewayError::Unauthorized);
     }
+
+    if call.billing_status.as_deref() != Some("posted") && call.call_control_id.is_none() {
+        if let Some(duration_seconds) = payload.duration_seconds {
+            return complete_app_call_session(
+                &state,
+                &call,
+                duration_seconds,
+                payload.rate_per_minute,
+            )
+            .await;
+        }
+    }
+
     let duration_seconds = i64::from(call.billed_seconds.unwrap_or(0).max(0));
     let credit_cost = call.credits_charged.unwrap_or(0.0);
     let remaining_credits = credit_balance(&state, account.account_id).await?;
@@ -725,6 +754,139 @@ async fn find_call(state: &AppState, id: &str) -> GatewayResult<VoiceCallRecord>
     .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| GatewayError::Upstream("voice call not found".to_string()))
+}
+
+async fn create_app_call_session(
+    state: &AppState,
+    account_id: Uuid,
+    call_id: &str,
+    to_number: &str,
+    service_code: &str,
+    rate_per_minute: f64,
+) -> GatewayResult<()> {
+    let from_number = if state.config.telnyx_from_number.trim().is_empty() {
+        "pera-x-app"
+    } else {
+        state.config.telnyx_from_number.trim()
+    };
+
+    sqlx::query(
+        r#"
+        insert into telnyx_voice_calls (
+            account_id,
+            call_id,
+            command_id,
+            direction,
+            from_number,
+            to_number,
+            status,
+            started_at,
+            service_code,
+            rate_per_minute,
+            billing_status,
+            last_raw_event
+        ) values ($1, $2, $3, 'outgoing', $4, $5, 'accepted', now(), $6, $7, 'pending', $8)
+        on conflict (call_id) do update
+        set status = excluded.status,
+            started_at = coalesce(telnyx_voice_calls.started_at, excluded.started_at),
+            service_code = excluded.service_code,
+            rate_per_minute = excluded.rate_per_minute,
+            billing_status = case
+                when telnyx_voice_calls.billing_status = 'not_billed' then excluded.billing_status
+                else telnyx_voice_calls.billing_status
+            end,
+            updated_at = now()
+        "#,
+    )
+    .bind(account_id)
+    .bind(call_id)
+    .bind(format!("cmd_{}", Uuid::new_v4().simple()))
+    .bind(from_number)
+    .bind(to_number.trim())
+    .bind(service_code)
+    .bind(rate_per_minute)
+    .bind(json!({
+        "source": "pera_x_ui_call_session",
+        "toNumber": to_number,
+        "serviceCode": service_code,
+        "ratePerMinute": rate_per_minute
+    }))
+    .execute(&state.db)
+    .await?;
+
+    Ok(())
+}
+
+async fn complete_app_call_session(
+    state: &AppState,
+    call: &VoiceCallRecord,
+    duration_seconds: i64,
+    fallback_rate_per_minute: Option<f64>,
+) -> GatewayResult<Json<EndCallResponse>> {
+    let Some(account_id) = call.account_id else {
+        return Err(GatewayError::Unauthorized);
+    };
+    let duration_seconds = duration_seconds.max(0);
+    let billed_minutes = ((duration_seconds as f64) / 60.0).ceil().max(1.0);
+    let rate_per_minute = call
+        .rate_per_minute
+        .or(fallback_rate_per_minute)
+        .unwrap_or(0.0)
+        .max(0.0);
+    if rate_per_minute <= 0.0 {
+        return Err(GatewayError::Upstream(
+            "call rate is missing for app call billing".to_string(),
+        ));
+    }
+    let credit_cost = round_credits(billed_minutes * rate_per_minute);
+    let source_reference = format!("app_voice_call:{}", call.call_id);
+    let debit = debit_credits(
+        state,
+        account_id,
+        credit_cost,
+        "app_voice_call",
+        &source_reference,
+        "Pera-X app call duration billing",
+        json!({
+            "callId": call.call_id,
+            "durationSeconds": duration_seconds,
+            "billedMinutes": billed_minutes,
+            "ratePerMinute": rate_per_minute
+        }),
+    )
+    .await?;
+
+    sqlx::query(
+        r#"
+        update telnyx_voice_calls
+        set status = 'completed',
+            ended_at = coalesce(ended_at, now()),
+            billed_seconds = $1,
+            billed_minutes = $2,
+            credits_charged = $3,
+            billing_status = 'posted',
+            billing_ledger_id = $4,
+            billing_error = null,
+            updated_at = now()
+        where id = $5
+        "#,
+    )
+    .bind(duration_seconds as i32)
+    .bind(billed_minutes)
+    .bind(credit_cost)
+    .bind(debit.ledger_id)
+    .bind(call.id)
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(EndCallResponse {
+        call_id: call.call_id.clone(),
+        status: "completed".to_string(),
+        duration_seconds,
+        credit_cost,
+        remaining_credits: debit.balance_after,
+        message: "Call completed and billed from app duration.".to_string(),
+    }))
 }
 
 async fn upsert_outbound_call(

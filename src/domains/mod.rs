@@ -17,3 +17,4 @@ pub mod solana;
 pub mod telecom;
 pub mod utility_catalog;
 pub mod v0_codegen;
+pub mod wallet;
