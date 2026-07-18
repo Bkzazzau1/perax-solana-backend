@@ -159,8 +159,7 @@ async fn confirm_checkout(
 
     if let Some(key) = idempotency_key.as_deref() {
         if let Some(existing) = find_order_by_idempotency(&state, account.account_id, key).await? {
-            let balance = credit_balance(&state, account.account_id).await?;
-            return Ok(Json(order_response(existing, balance, true)));
+            return reserve_or_return_existing(&state, account.account_id, existing).await;
         }
     }
 
@@ -226,21 +225,49 @@ async fn confirm_checkout(
             let key = idempotency_key.as_deref().ok_or_else(|| {
                 GatewayError::Upstream("checkout order could not be created".to_string())
             })?;
-            let existing = find_order_by_idempotency(&state, account.account_id, key)
+            find_order_by_idempotency(&state, account.account_id, key)
                 .await?
                 .ok_or_else(|| {
                     GatewayError::Upstream("idempotent checkout order is missing".to_string())
-                })?;
-            let balance = credit_balance(&state, account.account_id).await?;
-            return Ok(Json(order_response(existing, balance, true)));
+                })?
         }
     };
 
-    let reservation = reserve_checkout_credits(
+    reserve_checkout_order(
         &state,
         account.account_id,
+        order,
+        Some(quote_value_usd),
+    )
+    .await
+}
+
+async fn reserve_or_return_existing(
+    state: &AppState,
+    account_id: Uuid,
+    order: CheckoutOrderRow,
+) -> GatewayResult<Json<CheckoutConfirmResponse>> {
+    if order.order_status == "credits_reserved" {
+        let balance = credit_balance(state, account_id).await?;
+        return Ok(Json(order_response(order, balance, true)));
+    }
+
+    // An earlier process may have inserted the order but stopped before the ledger debit.
+    // Resume the same order under the account lock instead of returning an unpaid order.
+    reserve_checkout_order(state, account_id, order, None).await
+}
+
+async fn reserve_checkout_order(
+    state: &AppState,
+    account_id: Uuid,
+    order: CheckoutOrderRow,
+    quote_value_usd: Option<f64>,
+) -> GatewayResult<Json<CheckoutConfirmResponse>> {
+    let reservation = reserve_checkout_credits(
+        state,
+        account_id,
         order.id,
-        total_credit_cost,
+        order.total_credit_cost,
         json!({
             "orderReference": order.order_reference,
             "serviceCode": order.service_code,
@@ -254,7 +281,7 @@ async fn confirm_checkout(
     )
     .await?;
     let _ledger_id = reservation.ledger_id;
-    let completed = find_order_by_id(&state, account.account_id, order.id)
+    let completed = find_order_by_id(state, account_id, order.id)
         .await?
         .ok_or_else(|| GatewayError::Upstream("reserved checkout order is missing".to_string()))?;
 
