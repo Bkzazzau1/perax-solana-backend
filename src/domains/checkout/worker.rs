@@ -1,8 +1,7 @@
 use std::{env, time::Duration};
 
-use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -46,7 +45,17 @@ async fn process_available_jobs(state: &AppState, executor_url: &str) -> Gateway
         };
 
         match submit_job(state, executor_url, &job).await {
-            Ok(result) => reconcile_executor_result(state, &job, result).await?,
+            Ok(result) => {
+                if let Err(err) = reconcile_executor_result(state, &job, result).await {
+                    warn!(
+                        order_reference = %job.order_reference,
+                        settlement_id_hex = %job.settlement_id_hex,
+                        error = %err,
+                        "Settlement result could not be reconciled; order remains retryable"
+                    );
+                    release_claim_for_retry(state, job.id, &err.to_string()).await?;
+                }
+            }
             Err(err) => {
                 warn!(
                     order_reference = %job.order_reference,
@@ -88,7 +97,6 @@ async fn claim_next_job(state: &AppState) -> GatewayResult<Option<CheckoutSettle
             orders.id,
             orders.order_reference,
             orders.account_id,
-            orders.service_code,
             orders.quantity,
             orders.total_credit_cost::float8 as total_credit_cost,
             orders.settlement_id_hex,
@@ -160,6 +168,11 @@ async fn reconcile_executor_result(
     result: SettlementExecutorResponse,
 ) -> GatewayResult<()> {
     let normalized_status = normalize_executor_status(&result.status)?;
+    if result.terminal_failure && normalized_status != "failed" {
+        return Err(GatewayError::Upstream(
+            "terminalFailure may only accompany failed settlement status".to_string(),
+        ));
+    }
 
     if normalized_status == "failed" {
         if result.terminal_failure {
@@ -187,24 +200,33 @@ async fn reconcile_executor_result(
         return Ok(());
     }
 
-    if normalized_status == "finalized"
-        && (result
+    if normalized_status == "finalized" {
+        let settlement_record_address = result
             .settlement_record_address
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .is_none()
-            || result
-                .transaction_signature
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_none())
-    {
-        return Err(GatewayError::Upstream(
-            "finalized settlement response is missing record address or transaction signature"
-                .to_string(),
-        ));
+            .ok_or_else(|| {
+                GatewayError::Upstream(
+                    "finalized settlement response is missing record address".to_string(),
+                )
+            })?;
+        let transaction_signature = result
+            .transaction_signature
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                GatewayError::Upstream(
+                    "finalized settlement response is missing transaction signature".to_string(),
+                )
+            })?;
+        verify_finalized_on_chain(
+            state,
+            transaction_signature,
+            settlement_record_address,
+        )
+        .await?;
     }
 
     sqlx::query(
@@ -235,6 +257,88 @@ async fn reconcile_executor_result(
         "Checkout settlement executor result recorded"
     );
     Ok(())
+}
+
+async fn verify_finalized_on_chain(
+    state: &AppState,
+    transaction_signature: &str,
+    settlement_record_address: &str,
+) -> GatewayResult<()> {
+    let signature_response = solana_rpc(
+        state,
+        "getSignatureStatuses",
+        json!([[transaction_signature], { "searchTransactionHistory": true }]),
+    )
+    .await?;
+    let signature_status = signature_response
+        .pointer("/result/value/0")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| {
+            GatewayError::Upstream(
+                "settlement transaction signature is not visible on Solana".to_string(),
+            )
+        })?;
+    if !signature_status.get("err").unwrap_or(&Value::Null).is_null() {
+        return Err(GatewayError::Upstream(
+            "settlement transaction failed on Solana".to_string(),
+        ));
+    }
+    let confirmation = signature_status
+        .get("confirmationStatus")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !matches!(confirmation, "confirmed" | "finalized") {
+        return Err(GatewayError::Upstream(
+            "settlement transaction is not yet confirmed".to_string(),
+        ));
+    }
+
+    let account_response = solana_rpc(
+        state,
+        "getAccountInfo",
+        json!([settlement_record_address, { "encoding": "base64", "commitment": "confirmed" }]),
+    )
+    .await?;
+    let account = account_response
+        .pointer("/result/value")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| {
+            GatewayError::Upstream(
+                "settlement record account is not visible on Solana".to_string(),
+            )
+        })?;
+    let owner = account
+        .get("owner")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if owner != state.config.perax_program_id {
+        return Err(GatewayError::Upstream(
+            "settlement record is not owned by the configured Pera-X program".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn solana_rpc(state: &AppState, method: &str, params: Value) -> GatewayResult<Value> {
+    let response = state
+        .http
+        .post(&state.config.solana_rpc_url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params
+        }))
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.json::<Value>().await?;
+    if !status.is_success() || body.get("error").is_some() {
+        return Err(GatewayError::Upstream(format!(
+            "Solana RPC {method} verification failed: HTTP {status}; response={body}"
+        )));
+    }
+    Ok(body)
 }
 
 async fn release_claim_for_retry(
@@ -450,7 +554,6 @@ struct CheckoutSettlementJob {
     id: Uuid,
     order_reference: String,
     account_id: Uuid,
-    service_code: String,
     quantity: i64,
     total_credit_cost: f64,
     settlement_id_hex: String,
@@ -494,9 +597,4 @@ struct SettlementExecutorResponse {
     settlement_record_address: Option<String>,
     transaction_signature: Option<String>,
     error: Option<String>,
-}
-
-#[allow(dead_code)]
-fn _status_is_server_error(status: StatusCode) -> bool {
-    status.is_server_error()
 }
