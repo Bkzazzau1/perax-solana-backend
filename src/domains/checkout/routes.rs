@@ -11,8 +11,9 @@ use uuid::Uuid;
 use crate::{
     domains::{
         auth::middleware::AuthenticatedAccount,
+        checkout::ledger::reserve_checkout_credits,
         pricing,
-        telecom::billing::{credit_balance, debit_credits},
+        telecom::billing::credit_balance,
     },
     error::{GatewayError, GatewayResult},
     state::AppState,
@@ -80,8 +81,7 @@ async fn confirm_checkout(
         ));
     }
 
-    // These values came from older clients. Reading them prevents warnings; they are deliberately
-    // excluded from all pricing, authorization, balance, and settlement decisions.
+    // Older clients may still send these fields. They are deliberately ignored.
     let _ = (
         payload.product_name.as_ref(),
         payload.credit_cost,
@@ -236,13 +236,11 @@ async fn confirm_checkout(
         }
     };
 
-    let debit = match debit_credits(
+    let reservation = reserve_checkout_credits(
         &state,
         account.account_id,
+        order.id,
         total_credit_cost,
-        "checkout",
-        &order.order_reference,
-        "Authoritative product checkout",
         json!({
             "orderReference": order.order_reference,
             "serviceCode": order.service_code,
@@ -254,50 +252,17 @@ async fn confirm_checkout(
             "quoteValueUsd": quote_value_usd
         }),
     )
-    .await
-    {
-        Ok(debit) => debit,
-        Err(error) => {
-            sqlx::query(
-                "update checkout_settlement_orders set order_status = 'failed', settlement_error = $2, updated_at = now() where id = $1",
-            )
-            .bind(order.id)
-            .bind(error.to_string())
-            .execute(&state.db)
-            .await?;
-            return Err(error);
-        }
-    };
-
-    let completed = sqlx::query_as::<_, CheckoutOrderRow>(
-        r#"
-        update checkout_settlement_orders
-        set credit_ledger_id = $2,
-            order_status = 'credits_reserved',
-            settlement_status = 'pending',
-            settlement_error = null,
-            updated_at = now()
-        where id = $1
-        returning
-            id,
-            order_reference,
-            service_code,
-            service_name,
-            quantity,
-            unit_credit_cost::float8 as unit_credit_cost,
-            total_credit_cost::float8 as total_credit_cost,
-            settlement_id_hex,
-            settlement_product_id_hex,
-            order_status,
-            settlement_status
-        "#,
-    )
-    .bind(order.id)
-    .bind(debit.ledger_id)
-    .fetch_one(&state.db)
     .await?;
+    let _ledger_id = reservation.ledger_id;
+    let completed = find_order_by_id(&state, account.account_id, order.id)
+        .await?
+        .ok_or_else(|| GatewayError::Upstream("reserved checkout order is missing".to_string()))?;
 
-    Ok(Json(order_response(completed, debit.balance_after, false)))
+    Ok(Json(order_response(
+        completed,
+        reservation.balance_after,
+        reservation.already_reserved,
+    )))
 }
 
 async fn find_order_by_idempotency(
@@ -326,6 +291,37 @@ async fn find_order_by_idempotency(
     )
     .bind(account_id)
     .bind(idempotency_key)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(Into::into)
+}
+
+async fn find_order_by_id(
+    state: &AppState,
+    account_id: Uuid,
+    order_id: Uuid,
+) -> GatewayResult<Option<CheckoutOrderRow>> {
+    sqlx::query_as::<_, CheckoutOrderRow>(
+        r#"
+        select
+            id,
+            order_reference,
+            service_code,
+            service_name,
+            quantity,
+            unit_credit_cost::float8 as unit_credit_cost,
+            total_credit_cost::float8 as total_credit_cost,
+            settlement_id_hex,
+            settlement_product_id_hex,
+            order_status,
+            settlement_status
+        from checkout_settlement_orders
+        where account_id = $1 and id = $2
+        limit 1
+        "#,
+    )
+    .bind(account_id)
+    .bind(order_id)
     .fetch_optional(&state.db)
     .await
     .map_err(Into::into)
