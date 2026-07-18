@@ -24,6 +24,7 @@ async fn main() -> GatewayResult<()> {
     domains::solana::client::spawn_treasury_listener(state.clone());
     domains::solana::burner::spawn_daily_burner(state.clone());
     domains::solana::market_monitor::spawn_market_unlock_monitor(state.clone());
+    domains::checkout::worker::spawn_checkout_settlement_worker(state.clone());
     domains::telecom::inventory::spawn_number_renewal_worker(state.clone());
     domains::telecom::usage_reports::spawn_telnyx_usage_report_worker(state.clone());
 
