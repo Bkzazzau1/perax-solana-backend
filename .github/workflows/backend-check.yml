@@ -121,6 +121,9 @@ jobs:
         env:
           PGPASSWORD: postgres
 
+      - name: Validate authoritative checkout settlement source
+        run: python3 scripts/validate-checkout-settlement-source.py
+
       - name: Normalize formatting
         run: cargo fmt --all
 
