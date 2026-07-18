@@ -30,12 +30,10 @@ pub async fn reserve_checkout_credits(
 
     // Serialize every balance-changing checkout for this account. The lock is released
     // automatically when the transaction commits or rolls back.
-    sqlx::query_scalar::<_, i64>(
-        "select pg_advisory_xact_lock(hashtextextended($1, 0))::text::bigint",
-    )
-    .bind(account_id.to_string())
-    .fetch_optional(&mut *tx)
-    .await?;
+    sqlx::query("select pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(account_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
 
     let order = sqlx::query_as::<_, CheckoutOrderLock>(
         r#"
