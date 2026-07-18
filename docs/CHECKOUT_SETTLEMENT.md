@@ -17,7 +17,7 @@ The route now:
 9. Locks the checkout order row.
 10. Calculates the real posted Credits balance from `credit_ledger`.
 11. Inserts one idempotent debit and marks the order `credits_reserved` in the same transaction.
-12. Returns the settlement ID and product-policy ID required by the on-chain settlement worker.
+12. Returns the settlement ID and product-policy ID used by the settlement worker.
 
 Legacy request fields remain accepted temporarily for user-interface compatibility, but they are ignored for all financial decisions.
 
@@ -43,6 +43,22 @@ select pg_advisory_xact_lock(hashtextextended(account_id, 0));
 
 Every checkout debit for the same account is serialized until the transaction commits or rolls back. The balance is recalculated after the lock is acquired, preventing two concurrent orders from spending the same Credits.
 
+## Settlement worker
+
+The backend starts `spawn_checkout_settlement_worker` during application startup. The worker remains disabled when `PERAX_SETTLEMENT_EXECUTOR_URL` is empty.
+
+When enabled, it:
+
+1. Claims pending work with `FOR UPDATE SKIP LOCKED`.
+2. Reclaims abandoned jobs after the claim timeout.
+3. Sends the permanent settlement ID, SHA-256 product ID, factual funding method, quantity, and beneficiary to `POST /execute/settlement`.
+4. Keeps transport and non-terminal failures retryable.
+5. Records `planned`, `funding`, or `ready` progress without granting service.
+6. Before recording `finalized`, checks the transaction signature through Solana RPC and confirms the settlement-record account is owned by the configured Pera-X program.
+7. Stores the settlement record address and transaction signature.
+
+Executor requests are idempotent because every retry uses the same settlement ID. The on-chain settlement PDA prevents a second independent settlement record from being created for the same ID.
+
 ## Settlement status
 
 `checkout_settlement_orders.settlement_status` supports:
@@ -56,25 +72,39 @@ finalized
 failed
 ```
 
-The checkout route only creates and reserves the order. It does not claim an on-chain settlement occurred.
+A product must not be activated merely because Credits were reserved. Service activation should require `settlement_status = 'finalized'` unless the product has a separately approved asynchronous-delivery policy.
 
-The market-engine settlement worker must later:
+## Terminal-failure refunds
 
-1. Select a fresh APC observation.
-2. Call `plan_settlement` using the stored settlement ID and SHA-256 product ID.
-3. Follow the contract-returned mode.
-4. Execute direct PEX, atomic market purchase, policy-vault funding, or hybrid funding.
-5. Call `finalize_settlement`.
-6. Store the settlement record address and final transaction signature.
-7. Mark the order `finalized` only after confirmed on-chain finalization.
+Only an executor response with both:
 
-## Failure handling
+```text
+status = failed
+terminalFailure = true
+```
 
-A product must not be activated merely because Credits were reserved.
+can trigger an automatic refund.
 
-Service activation should require `settlement_status = 'finalized'` unless the product has a separately approved asynchronous-delivery policy.
+The worker then:
 
-A refund workflow is still required for orders that permanently fail after Credits reservation. It must insert a new idempotent positive `credit_ledger` entry; it must never delete or edit the original debit.
+1. Acquires the same account advisory lock used for checkout debits.
+2. Locks the order row.
+3. Refuses to refund a finalized order.
+4. Checks whether a refund ledger entry already exists.
+5. Inserts a new positive `credit_ledger` entry with source `checkout_refund`.
+6. Marks the order and settlement failed in the same transaction.
+
+The original debit is never deleted or edited.
+
+## Executor configuration
+
+```env
+PERAX_SETTLEMENT_EXECUTOR_URL=http://127.0.0.1:8790
+PERAX_SETTLEMENT_EXECUTOR_TOKEN=replace-with-a-private-service-token
+PERAX_SETTLEMENT_INTERVAL_SECONDS=30
+```
+
+The backend appends `/execute/settlement` when the URL does not already include it.
 
 ## Validation
 
